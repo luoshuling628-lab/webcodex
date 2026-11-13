@@ -340,31 +340,36 @@ impl AdminProjectLifecycleService {
                 return Err(api_error(409, "project_root_unverified"));
             }
         }
-        let (active_jobs, _unregister_fence) = if action == "unregister" {
+        let (active_jobs, _unregister_fence, _session_retirement_guard) = if action == "unregister"
+        {
             let active = runtime
                 .runner_registry
                 .begin_project_unregister(access.as_ref(), target)
                 .await
                 .map_err(|_| api_error(500, "operation_failed"))?;
+            // Own the Runner fence immediately, including early error exits.
+            let project_unregister_fence = (active == 0).then(|| ProjectUnregisterFence {
+                registry: runtime.runner_registry.clone(),
+                project: target.to_string(),
+            });
             if active > 0 {
                 return Err(ServiceResponse {
                     status: 409,
                     body: json!({"error":{"code":"active_jobs_conflict"},"active_jobs":active}),
                 });
             }
-            (
-                active,
-                Some(ProjectUnregisterFence {
-                    registry: runtime.runner_registry.clone(),
-                    project: target.to_string(),
-                }),
-            )
+            let session_guard = runtime
+                .sessions
+                .begin_project_unregister_fence(target)
+                .map_err(|_| api_error(409, "retained_sessions_or_retirement_conflict"))?;
+            (active, project_unregister_fence, Some(session_guard))
         } else {
             (
                 runtime
                     .runner_registry
                     .count_active_jobs_for_project(access.as_ref(), target)
                     .await,
+                None,
                 None,
             )
         };

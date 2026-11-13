@@ -391,6 +391,98 @@ fn session_lifecycle_wire_values_are_snake_case() {
 // --- Workflow session lifecycle (Phase 2: explicit close) ---
 
 #[test]
+fn retained_project_session_counts_are_exact_and_cover_all_lifecycles() {
+    let store = SessionStore::default();
+    let project = "agent:ruoshui:project-a";
+    let active = store.start_session(Some(project.to_string()), Some("active".to_string()));
+    let closed = store.start_session(Some(project.to_string()), Some("closed".to_string()));
+    let _other = store.start_session(
+        Some("agent:ruoshui:project-b".to_string()),
+        Some("other project".to_string()),
+    );
+    let _projectless = store.start_session(None, Some("no project".to_string()));
+
+    assert_ne!(active.session_id, closed.session_id);
+    assert_eq!(store.retained_project_session_counts(project), (2, 0));
+    store.close_session(&closed.session_id).unwrap();
+    assert_eq!(store.retained_project_session_counts(project), (1, 1));
+    assert_eq!(
+        store.retained_project_session_counts("agent:ruoshui:project-b"),
+        (1, 0)
+    );
+    assert_eq!(
+        store.retained_project_session_counts("agent:ruoshui:absent"),
+        (0, 0)
+    );
+}
+
+#[test]
+fn project_unregister_fence_blocks_racing_session_creation_and_preserves_history() {
+    let store = SessionStore::default();
+    let project = "agent:ruoshui:retiring";
+    let guard = store
+        .begin_project_unregister_fence(project)
+        .expect("unused project can be fenced");
+    assert!(store.begin_project_unregister_fence(project).is_err());
+    let concurrent = store.clone();
+    let creation_result = std::thread::spawn(move || {
+        concurrent.start_session_with_options(crate::SessionCreateOptions::new(
+            Some(project.to_string()),
+            Some("racing creator".to_string()),
+            SessionMode::Normal,
+            SessionGuards::default(),
+        ))
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        creation_result.unwrap_err(),
+        "project_retirement_in_progress"
+    );
+    assert_eq!(store.retained_project_session_counts(project), (0, 0));
+    let coding_attempt = store.ensure_coding_session(crate::CodingSessionRequest {
+        project: project.to_string(),
+        project_identity: None,
+        authority_fingerprint: crate::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT.to_string(),
+        resume_session_id: None,
+        instruction: Some("concurrent coding bootstrap".to_string()),
+        mode: SessionMode::Normal,
+        guards: SessionGuards::default(),
+        execution_context: None,
+        project_instructions: None,
+        transport: SessionTransport::Api,
+        context_refreshed: false,
+        write_scope_verified: false,
+    });
+    assert!(matches!(
+        coding_attempt,
+        Err(crate::CodingSessionError::CommitFailed)
+    ));
+    drop(guard);
+
+    let created = store.start_session(Some(project.to_string()), Some("after release".to_string()));
+    assert_eq!(created.lifecycle, SessionLifecycle::Active);
+    // Unregister cannot erase or block authorized retained Session history.
+    let guard = store.begin_project_unregister_fence(project).unwrap();
+    assert_eq!(store.retained_project_session_counts(project), (1, 0));
+    assert!(store
+        .start_session_with_options(crate::SessionCreateOptions::new(
+            Some(project.to_string()),
+            None,
+            SessionMode::Normal,
+            SessionGuards::default(),
+        ))
+        .is_err());
+    store.close_session(&created.session_id).unwrap();
+    assert_eq!(store.retained_project_session_counts(project), (0, 1));
+    drop(guard);
+    // Closed history is retained and does not permanently bar unregister.
+    let guard = store.begin_project_unregister_fence(project).unwrap();
+    assert_eq!(store.retained_project_session_counts(project), (0, 1));
+    drop(guard);
+}
+
+#[test]
 fn active_to_closed_succeeds_and_emits_session_closed_event() {
     let store = SessionStore::default();
     let session = store.start_session(None, Some("close me".to_string()));
