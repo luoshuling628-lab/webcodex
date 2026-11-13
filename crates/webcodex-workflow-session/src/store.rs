@@ -150,21 +150,21 @@ impl SessionDurability<'_> {
     }
 }
 
-/// Project retirement guard. Creation and retirement share SessionStore mutex.
+/// Project unregister guard. Creation and unregister share SessionStore mutex.
 /// The fence releases on normal completion, errors, cancellation and Drop.
-pub struct SessionProjectRetirementGuard {
+pub struct SessionProjectUnregisterGuard {
     store: SessionStore,
     project: String,
 }
 
-impl Drop for SessionProjectRetirementGuard {
+impl Drop for SessionProjectUnregisterGuard {
     fn drop(&mut self) {
         let mut inner = self
             .store
             .inner
             .lock()
             .expect("session store mutex poisoned");
-        inner.retiring_projects.remove(&self.project);
+        inner.unregistering_projects.remove(&self.project);
     }
 }
 
@@ -172,7 +172,7 @@ impl Drop for SessionProjectRetirementGuard {
 pub(super) struct SessionStoreInner {
     /// Durable workflow sessions. Mutated only via the helpers below.
     sessions: SessionRecords,
-    retiring_projects: BTreeSet<String>,
+    unregistering_projects: BTreeSet<String>,
     lru: SessionRecency,
     hot_session_capacity_target: usize,
     cache_target_bytes: usize,
@@ -208,7 +208,7 @@ impl SessionStore {
         Self {
             inner: Arc::new(Mutex::new(SessionStoreInner {
                 sessions: SessionRecords::default(),
-                retiring_projects: BTreeSet::new(),
+                unregistering_projects: BTreeSet::new(),
                 lru: SessionRecency::default(),
                 hot_session_capacity_target,
                 cache_target_bytes: DEFAULT_SESSION_CACHE_BYTES,
@@ -304,7 +304,7 @@ impl SessionStore {
                 generation,
                 ..SessionRecords::restored(sessions)
             },
-            retiring_projects: BTreeSet::new(),
+            unregistering_projects: BTreeSet::new(),
             lru,
             hot_session_capacity_target: DEFAULT_MAX_SESSIONS,
             cache_target_bytes,
@@ -515,7 +515,7 @@ impl SessionStore {
             if opts
                 .project
                 .as_ref()
-                .is_some_and(|p| inner.retiring_projects.contains(p))
+                .is_some_and(|p| inner.unregistering_projects.contains(p))
             {
                 return Err("project_retirement_in_progress".to_string());
             }
@@ -619,7 +619,7 @@ impl SessionStore {
 
         let outcome = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
-            if inner.retiring_projects.contains(&request.project) {
+            if inner.unregistering_projects.contains(&request.project) {
                 return Err(CodingSessionError::CommitFailed);
             }
             let reusable_session_id = if let Some(session_id) = explicit_resume_session_id {
@@ -970,25 +970,19 @@ impl SessionStore {
     /// creation-time authority group. Filter before counting/pagination; foreign
     /// Sessions cannot affect totals or hide authorized rows behind a page limit.
     /// Inventory ordering is presentation only, never an implicit resume rule.
-    /// Atomically refuse retirement while any Session references this Project.
-    /// The guard blocks future normal/Coding Session creation until Drop.
-    pub fn begin_project_retirement(
+    /// Fence new Session creation during protected Project unregister.
+    /// Existing Active/Closed Sessions are retained for authorized historical
+    /// reads and closure. Physical worktree deletion has separate admission gates.
+    pub fn begin_project_unregister_fence(
         &self,
         project: &str,
-    ) -> Result<SessionProjectRetirementGuard, String> {
+    ) -> Result<SessionProjectUnregisterGuard, String> {
         let mut inner = self.inner.lock().expect("session store mutex poisoned");
-        if inner.retiring_projects.contains(project) {
+        if inner.unregistering_projects.contains(project) {
             return Err("project_retirement_already_in_progress".to_string());
         }
-        if inner
-            .sessions
-            .values()
-            .any(|record| record.project() == Some(project))
-        {
-            return Err("retained_sessions_conflict".to_string());
-        }
-        inner.retiring_projects.insert(project.to_string());
-        Ok(SessionProjectRetirementGuard {
+        inner.unregistering_projects.insert(project.to_string());
+        Ok(SessionProjectUnregisterGuard {
             store: self.clone(),
             project: project.to_string(),
         })

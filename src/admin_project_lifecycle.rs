@@ -360,7 +360,7 @@ impl AdminProjectLifecycleService {
             }
             let session_guard = runtime
                 .sessions
-                .begin_project_retirement(target)
+                .begin_project_unregister_fence(target)
                 .map_err(|_| api_error(409, "retained_sessions_or_retirement_conflict"))?;
             (active, project_unregister_fence, Some(session_guard))
         } else {
@@ -1241,74 +1241,6 @@ mod tests {
                 .unwrap(),
             2,
             "the owner's active Jobs must remain authoritative for the unregister fence"
-        );
-    }
-
-    #[tokio::test]
-    async fn unregister_rejects_retained_sessions_without_running_jobs() {
-        let registry = Arc::new(RunnerRegistry::default());
-        let target = "agent:session-guard-runner:retained";
-        registry
-            .register(crate::test_support::current_runner_registration(
-                RunnerRegisterRequest {
-                    computer_session_availability: None,
-                    computer_control_epoch: None,
-                    client_id: "session-guard-runner".to_string(),
-                    runner_instance_id: "instance-session-guard".to_string(),
-                    runner_protocol_generation:
-                        crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-                    display_name: None,
-                    owner: None,
-                    hostname: None,
-                    host_context: None,
-                    capabilities: RunnerCapabilities {
-                        jobs: true,
-                        async_jobs: true,
-                        async_shell_jobs: true,
-                        project_lifecycle: true,
-                        ..Default::default()
-                    },
-                    policy: None,
-                    process_started_at: None,
-                    build: None,
-                    job_concurrency_limit: None,
-                    job_inventory: None,
-                    coding_agent_providers: None,
-                    coding_agent_inventory: None,
-                },
-            ))
-            .await
-            .unwrap();
-
-        let runtime = ToolRuntime::new_for_tests_with_runner_registry(registry);
-        let session = runtime.sessions.start_session(
-            Some(target.to_string()),
-            Some("retained session".to_string()),
-        );
-        let revision = format!("sha256:{}", "a".repeat(64));
-        let response = tokio::time::timeout(
-            Duration::from_millis(250),
-            unregister_project_runtime(&runtime, None, target, &revision),
-        )
-        .await
-        .expect("retained active Session must block unregister without a Runner operation");
-        assert_eq!(response.status, 409);
-        assert_eq!(
-            response.body["error"]["code"],
-            "retained_sessions_or_retirement_conflict"
-        );
-
-        runtime.sessions.close_session(&session.session_id).unwrap();
-        let response = tokio::time::timeout(
-            Duration::from_millis(250),
-            unregister_project_runtime(&runtime, None, target, &revision),
-        )
-        .await
-        .expect("retained closed Session must also block unregister");
-        assert_eq!(response.status, 409);
-        assert_eq!(
-            response.body["error"]["code"],
-            "retained_sessions_or_retirement_conflict"
         );
     }
 

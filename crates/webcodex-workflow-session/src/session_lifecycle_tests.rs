@@ -417,13 +417,13 @@ fn retained_project_session_counts_are_exact_and_cover_all_lifecycles() {
 }
 
 #[test]
-fn project_retirement_fence_blocks_racing_session_creation_and_releases_on_drop() {
+fn project_unregister_fence_blocks_racing_session_creation_and_preserves_history() {
     let store = SessionStore::default();
     let project = "agent:ruoshui:retiring";
     let guard = store
-        .begin_project_retirement(project)
+        .begin_project_unregister_fence(project)
         .expect("unused project can be fenced");
-    assert!(store.begin_project_retirement(project).is_err());
+    assert!(store.begin_project_unregister_fence(project).is_err());
     let concurrent = store.clone();
     let creation_result = std::thread::spawn(move || {
         concurrent.start_session_with_options(crate::SessionCreateOptions::new(
@@ -462,16 +462,24 @@ fn project_retirement_fence_blocks_racing_session_creation_and_releases_on_drop(
 
     let created = store.start_session(Some(project.to_string()), Some("after release".to_string()));
     assert_eq!(created.lifecycle, SessionLifecycle::Active);
-    assert_eq!(
-        store.begin_project_retirement(project).err().as_deref(),
-        Some("retained_sessions_conflict")
-    );
+    // Unregister cannot erase or block authorized retained Session history.
+    let guard = store.begin_project_unregister_fence(project).unwrap();
+    assert_eq!(store.retained_project_session_counts(project), (1, 0));
+    assert!(store
+        .start_session_with_options(crate::SessionCreateOptions::new(
+            Some(project.to_string()),
+            None,
+            SessionMode::Normal,
+            SessionGuards::default(),
+        ))
+        .is_err());
     store.close_session(&created.session_id).unwrap();
-    // Closing alone must not erase a retained Session reference.
-    assert_eq!(
-        store.begin_project_retirement(project).err().as_deref(),
-        Some("retained_sessions_conflict")
-    );
+    assert_eq!(store.retained_project_session_counts(project), (0, 1));
+    drop(guard);
+    // Closed history is retained and does not permanently bar unregister.
+    let guard = store.begin_project_unregister_fence(project).unwrap();
+    assert_eq!(store.retained_project_session_counts(project), (0, 1));
+    drop(guard);
 }
 
 #[test]
