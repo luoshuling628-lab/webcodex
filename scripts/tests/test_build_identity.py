@@ -12,6 +12,19 @@ import unittest
 BUILD_SCRIPT = Path(__file__).resolve().parents[2] / "crates/webcodex-build-info/build.rs"
 
 
+def build_script_outputs(root: Path) -> list[Path]:
+    """Find the Cargo build-script stdout in both legacy and Cargo 1.100 layouts.
+
+    The target artifact cache layout is Cargo-internal and changed in 1.100.
+    These tests inspect it only to assert re-run/no-op behavior, not as an API.
+    """
+    base = root / "target" / "debug" / "build"
+    return sorted([
+        *base.glob("identity-fixture-*/output"),
+        *base.glob("identity-fixture/*/run/stdout"),
+    ])
+
+
 class BuildIdentityTests(unittest.TestCase):
     def test_packed_branch_without_reflog_refreshes_and_then_stays_cached(self):
         for linked_worktree in (False, True):
@@ -63,7 +76,7 @@ class BuildIdentityTests(unittest.TestCase):
                     return run(package, "cargo", "run", "--offline", "--quiet")
 
                 before = build()
-                outputs = list((root / "target/debug/build").glob("identity-fixture-*/output"))
+                outputs = build_script_outputs(root)
                 self.assertEqual(len(outputs), 1)
                 stamp = outputs[0].stat().st_mtime_ns
                 self.assertEqual(build(), before)
@@ -128,7 +141,7 @@ class BuildIdentityTests(unittest.TestCase):
                 (repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
                 self.assertEqual(run(repo, "git", "rev-parse", "HEAD"), head)
                 self.assertEqual(build(), "true")
-                outputs = list((root / "target/debug/build").glob("identity-fixture-*/output"))
+                outputs = build_script_outputs(root)
                 self.assertEqual(len(outputs), 1)
                 dirty_stamp = outputs[0].stat().st_mtime_ns
                 (repo / "other.txt").write_text("also dirty\n", encoding="utf-8")
@@ -152,7 +165,7 @@ class BuildIdentityTests(unittest.TestCase):
 
                 env["WEBCODEX_GIT_DIRTY"] = "false"
                 self.assertEqual(build(), "false")
-                outputs = list((root / "target/debug/build").glob("identity-fixture-*/output"))
+                outputs = build_script_outputs(root)
                 self.assertEqual(len(outputs), 1)
                 stamp = outputs[0].stat().st_mtime_ns
                 (repo / "tracked.txt").write_text("dirty with pinned identity\n", encoding="utf-8")
