@@ -88,7 +88,7 @@ pub use model::{
     TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD, TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE,
     TOOL_RESULT_EXPECTATION_FIELD,
 };
-pub use store::SessionStore;
+pub use store::{SessionProjectRetirementGuard, SessionStore};
 pub use util::redact_and_bound_instruction;
 
 #[cfg(any(test, feature = "root-test-support"))]

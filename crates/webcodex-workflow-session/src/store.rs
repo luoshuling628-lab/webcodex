@@ -150,10 +150,25 @@ impl SessionDurability<'_> {
     }
 }
 
+/// Project retirement guard. Creation and retirement share SessionStore mutex.
+/// The fence releases on normal completion, errors, cancellation and Drop.
+pub struct SessionProjectRetirementGuard {
+    store: SessionStore,
+    project: String,
+}
+
+impl Drop for SessionProjectRetirementGuard {
+    fn drop(&mut self) {
+        let mut inner = self.store.inner.lock().expect("session store mutex poisoned");
+        inner.retiring_projects.remove(&self.project);
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct SessionStoreInner {
     /// Durable workflow sessions. Mutated only via the helpers below.
     sessions: SessionRecords,
+    retiring_projects: BTreeSet<String>,
     lru: SessionRecency,
     hot_session_capacity_target: usize,
     cache_target_bytes: usize,
@@ -189,6 +204,7 @@ impl SessionStore {
         Self {
             inner: Arc::new(Mutex::new(SessionStoreInner {
                 sessions: SessionRecords::default(),
+                retiring_projects: BTreeSet::new(),
                 lru: SessionRecency::default(),
                 hot_session_capacity_target,
                 cache_target_bytes: DEFAULT_SESSION_CACHE_BYTES,
@@ -284,6 +300,7 @@ impl SessionStore {
                 generation,
                 ..SessionRecords::restored(sessions)
             },
+            retiring_projects: BTreeSet::new(),
             lru,
             hot_session_capacity_target: DEFAULT_MAX_SESSIONS,
             cache_target_bytes,
@@ -491,6 +508,9 @@ impl SessionStore {
         }
         let summary = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            if opts.project.as_ref().is_some_and(|p| inner.retiring_projects.contains(p)) {
+                return Err("project_retirement_in_progress".to_string());
+            }
             let session_id = inner
                 .allocate_session_id(webcodex_core::compact::random_suffix::<12>)
                 .ok_or_else(|| "session_id_allocation_exhausted".to_string())?;
@@ -591,6 +611,9 @@ impl SessionStore {
 
         let outcome = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            if inner.retiring_projects.contains(&request.project) {
+                return Err(CodingSessionError::CommitFailed);
+            }
             let reusable_session_id = if let Some(session_id) = explicit_resume_session_id {
                 let Some(stored) = inner.sessions.get(&session_id) else {
                     if inner
@@ -939,6 +962,41 @@ impl SessionStore {
     /// creation-time authority group. Filter before counting/pagination; foreign
     /// Sessions cannot affect totals or hide authorized rows behind a page limit.
     /// Inventory ordering is presentation only, never an implicit resume rule.
+    /// Atomically refuse retirement while any Session references this Project.
+    /// The guard blocks future normal/Coding Session creation until Drop.
+    pub fn begin_project_retirement(
+        &self,
+        project: &str,
+    ) -> Result<SessionProjectRetirementGuard, String> {
+        let mut inner = self.inner.lock().expect("session store mutex poisoned");
+        if inner.retiring_projects.contains(project) {
+            return Err("project_retirement_already_in_progress".to_string());
+        }
+        if inner.sessions.values().any(|record| record.project() == Some(project)) {
+            return Err("retained_sessions_conflict".to_string());
+        }
+        inner.retiring_projects.insert(project.to_string());
+        Ok(SessionProjectRetirementGuard {
+            store: self.clone(),
+            project: project.to_string(),
+        })
+    }
+
+    /// Cross-authority metadata count. Never leaks Session ID or content.
+    pub fn retained_project_session_counts(&self, project: &str) -> (usize, usize) {
+        let inner = self.inner.lock().expect("session store mutex poisoned");
+        let mut active = 0;
+        let mut closed = 0;
+        for record in inner.sessions.values() {
+            if record.project() != Some(project) { continue; }
+            match record.lifecycle() {
+                SessionLifecycle::Active => active += 1,
+                SessionLifecycle::Closed => closed += 1,
+            }
+        }
+        (active, closed)
+    }
+
     pub fn discover_sessions(
         &self,
         project: &str,
