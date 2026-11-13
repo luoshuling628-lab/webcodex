@@ -159,7 +159,11 @@ pub struct SessionProjectRetirementGuard {
 
 impl Drop for SessionProjectRetirementGuard {
     fn drop(&mut self) {
-        let mut inner = self.store.inner.lock().expect("session store mutex poisoned");
+        let mut inner = self
+            .store
+            .inner
+            .lock()
+            .expect("session store mutex poisoned");
         inner.retiring_projects.remove(&self.project);
     }
 }
@@ -508,7 +512,11 @@ impl SessionStore {
         }
         let summary = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
-            if opts.project.as_ref().is_some_and(|p| inner.retiring_projects.contains(p)) {
+            if opts
+                .project
+                .as_ref()
+                .is_some_and(|p| inner.retiring_projects.contains(p))
+            {
                 return Err("project_retirement_in_progress".to_string());
             }
             let session_id = inner
@@ -972,7 +980,11 @@ impl SessionStore {
         if inner.retiring_projects.contains(project) {
             return Err("project_retirement_already_in_progress".to_string());
         }
-        if inner.sessions.values().any(|record| record.project() == Some(project)) {
+        if inner
+            .sessions
+            .values()
+            .any(|record| record.project() == Some(project))
+        {
             return Err("retained_sessions_conflict".to_string());
         }
         inner.retiring_projects.insert(project.to_string());
@@ -988,7 +1000,9 @@ impl SessionStore {
         let mut active = 0;
         let mut closed = 0;
         for record in inner.sessions.values() {
-            if record.project() != Some(project) { continue; }
+            if record.project() != Some(project) {
+                continue;
+            }
             match record.lifecycle() {
                 SessionLifecycle::Active => active += 1,
                 SessionLifecycle::Closed => closed += 1,

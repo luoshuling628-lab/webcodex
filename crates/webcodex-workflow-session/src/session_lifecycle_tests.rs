@@ -420,7 +420,9 @@ fn retained_project_session_counts_are_exact_and_cover_all_lifecycles() {
 fn project_retirement_fence_blocks_racing_session_creation_and_releases_on_drop() {
     let store = SessionStore::default();
     let project = "agent:ruoshui:retiring";
-    let guard = store.begin_project_retirement(project).expect("unused project can be fenced");
+    let guard = store
+        .begin_project_retirement(project)
+        .expect("unused project can be fenced");
     assert!(store.begin_project_retirement(project).is_err());
     let concurrent = store.clone();
     let creation_result = std::thread::spawn(move || {
@@ -430,8 +432,13 @@ fn project_retirement_fence_blocks_racing_session_creation_and_releases_on_drop(
             SessionMode::Normal,
             SessionGuards::default(),
         ))
-    }).join().unwrap();
-    assert_eq!(creation_result.unwrap_err(), "project_retirement_in_progress");
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        creation_result.unwrap_err(),
+        "project_retirement_in_progress"
+    );
     assert_eq!(store.retained_project_session_counts(project), (0, 0));
     let coding_attempt = store.ensure_coding_session(crate::CodingSessionRequest {
         project: project.to_string(),
@@ -447,7 +454,10 @@ fn project_retirement_fence_blocks_racing_session_creation_and_releases_on_drop(
         context_refreshed: false,
         write_scope_verified: false,
     });
-    assert!(matches!(coding_attempt, Err(crate::CodingSessionError::CommitFailed)));
+    assert!(matches!(
+        coding_attempt,
+        Err(crate::CodingSessionError::CommitFailed)
+    ));
     drop(guard);
 
     let created = store.start_session(Some(project.to_string()), Some("after release".to_string()));
