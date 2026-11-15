@@ -115,6 +115,112 @@ impl Drop for ProjectUnregisterFence {
     }
 }
 
+/// Native closeout-only Owner fences. Both are held over the full future
+/// closeout transaction and released even if execution fails or is cancelled.
+/// This is not a removal permit: the Runner must independently check the
+/// exact revision, source lineage, process leases, remote recoverability and
+/// persisted post-removal receipt before doing any filesystem mutation.
+#[allow(dead_code)]
+pub(crate) struct NativeManagedCloseoutFences {
+    _jobs: ProjectUnregisterFence,
+    _sessions: webcodex_workflow_session::SessionProjectUnregisterGuard,
+}
+
+fn native_closeout_owner_identity_ready(
+    project: &RunnerProjectSummary,
+    expected_revision: &str,
+) -> bool {
+    matches!(
+        project.lineage,
+        Some(crate::runner_protocol::RunnerProjectLineage::ManagedWorktreeSource { .. })
+    ) && project.registration_source.as_deref() == Some("auto_registered")
+        && project.registration_incarnation.is_some()
+        && project.root_fingerprint.is_some()
+        && project.revision.as_deref() == Some(expected_revision)
+        && project.git_dirty == Some(false)
+        && project.git_head.is_some()
+}
+
+/// Acquire the existing Runner job-start fence and the stronger native
+/// Session closeout fence in that order. A successful return does NOT authorize
+/// unregister or Git deletion. Unlike ordinary Project unregister, the
+/// native path requires at least one durably closed exact Project Session.
+#[allow(dead_code)]
+pub(crate) async fn begin_native_managed_closeout_fences(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    target: &str,
+    expected_revision: &str,
+) -> Result<NativeManagedCloseoutFences, ServiceResponse> {
+    if !admin_project_mutation_authorized(auth) {
+        return Err(api_error(403, "admin_authority_required"));
+    }
+    validate_revision(expected_revision)?;
+    let (client_id, project_id) = parse_runtime_project(target)?;
+    let access = crate::runner_http::runner_access_from_auth(Some(auth));
+    runtime
+        .runner_registry
+        .assert_runner_access(access.as_ref(), &client_id)
+        .await
+        .map_err(|_| api_error(403, "runner_access_denied"))?;
+    let client = runtime
+        .runner_registry
+        .get_runner_semantic_view_for_auth(&client_id, access.as_ref())
+        .await
+        .ok_or_else(|| api_error(503, "agent_unavailable"))?;
+    if !client.view.connected || client.view.status != "online" {
+        return Err(api_error(503, "agent_unavailable"));
+    }
+    if !client.supports(RunnerFeature::ProjectLifecycle) {
+        return Err(api_error(409, "unsupported_runner_version"));
+    }
+    if !client
+        .view
+        .project_inventory
+        .as_ref()
+        .is_some_and(|inventory| inventory.sync_state == "complete")
+    {
+        return Err(api_error(409, "runner_inventory_incomplete"));
+    }
+    let project = client
+        .view
+        .projects
+        .iter()
+        .find(|entry| entry.id == project_id)
+        .ok_or_else(|| api_error(404, "project_not_found"))?;
+    if !native_closeout_owner_identity_ready(project, expected_revision) {
+        return Err(api_error(409, "native_closeout_identity_unverified"));
+    }
+
+    let active_jobs = runtime
+        .runner_registry
+        .begin_project_unregister(access.as_ref(), target)
+        .await
+        .map_err(|_| api_error(409, "runner_retirement_conflict"))?;
+    let jobs_guard = ProjectUnregisterFence {
+        registry: runtime.runner_registry.clone(),
+        project: target.to_string(),
+    };
+    if active_jobs != 0 {
+        return Err(api_error(409, "active_jobs_conflict"));
+    }
+    let sessions_guard = runtime
+        .sessions
+        .begin_managed_worktree_cleanup_fence(target)
+        .map_err(|_| api_error(409, "native_sessions_not_durably_closed"))?;
+    // Ensure the SessionStore's durable closure evidence is committed before
+    // any future caller can even consider Runner-side physical removal.
+    runtime
+        .sessions
+        .flush()
+        .await
+        .map_err(|_| api_error(503, "native_closeout_session_persistence_uncertain"))?;
+    Ok(NativeManagedCloseoutFences {
+        _jobs: jobs_guard,
+        _sessions: sessions_guard,
+    })
+}
+
 #[derive(Clone)]
 pub(crate) struct AdminProjectLifecycleService {
     runtime: Arc<ToolRuntime>,
@@ -1027,6 +1133,37 @@ mod tests {
     use webcodex_runner_registry::{JobStartContext, JobStartRequest};
 
     use crate::runner_protocol::{RunnerCapabilities, RunnerRegisterRequest};
+
+    #[test]
+    fn native_managed_closeout_requires_exact_registered_clean_identity() {
+        let mut project: RunnerProjectSummary = serde_json::from_value(json!({
+            "id":"new-child", "path":"/disposable-child",
+            "registration_source":"auto_registered",
+            "registration_incarnation":"11111111-1111-4111-8111-111111111111",
+            "root_fingerprint":"wc_projroot_test",
+            "revision": format!("sha256:{}", "a".repeat(64)),
+            "git_dirty":false,
+            "git_head":"0123456789012345678901234567890123456789",
+            "lineage":{
+                "kind":"managed_worktree_source",
+                "source_project_id":"original",
+                "source_root_fingerprint":"wc_projroot_source",
+                "base_sha":"0123456789012345678901234567890123456789"
+            }
+        })).unwrap();
+        let expected = format!("sha256:{}", "a".repeat(64));
+        assert!(native_closeout_owner_identity_ready(&project, &expected));
+        assert!(!native_closeout_owner_identity_ready(
+            &project, &format!("sha256:{}", "b".repeat(64))
+        ));
+        project.git_dirty = None;
+        assert!(!native_closeout_owner_identity_ready(&project, &expected));
+        project.git_dirty = Some(false);
+        project.lineage = None;
+        assert!(!native_closeout_owner_identity_ready(&project, &expected));
+        project.registration_source = Some("explicit".into());
+        assert!(!native_closeout_owner_identity_ready(&project, &expected));
+    }
 
     #[test]
     fn project_settings_permission_rejects_ordinary_and_machine_credentials() {
