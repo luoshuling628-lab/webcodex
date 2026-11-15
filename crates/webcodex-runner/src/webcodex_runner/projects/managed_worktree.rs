@@ -274,6 +274,55 @@ fn source_mentions_worktree_path(source: &Path, worktree: &Path) -> Result<bool,
  * successful Project CAS unregister. Call only under the trusted native
  * closeout Owner after verifying exact managed registration identity.
  */
+/// Validate the *registered* immutable lineage before considering physical
+/// reclamation. A folder name, an observation JSON, or a process-wide empty
+/// queue is never sufficient to establish ownership.
+pub(super) fn managed_worktree_reclaim_lineage_gate(
+    child: &RunnerProjectFile,
+    source_project: &RunnerProjectFile,
+) -> Result<(), &'static str> {
+    if !child.managed_worktree
+        || effective_registration_source(child).as_str() != AUTO_REGISTERED_REGISTRATION_SOURCE
+        || child.registration_incarnation.as_deref().is_none_or(|v| uuid::Uuid::parse_str(v).is_err())
+        || child.managed_operation_id.as_deref().is_none_or(|v| uuid::Uuid::parse_str(v).is_err())
+    {
+        return Err("managed_reclaim_registration_identity_invalid");
+    }
+    if child.managed_source_project_id.as_deref() != Some(source_project.id.as_str())
+        || source_project.managed_worktree
+        || child.id == source_project.id
+    {
+        return Err("managed_reclaim_source_project_mismatch");
+    }
+    let source = canonicalize_existing(Path::new(&source_project.path))
+        .map_err(|_| "managed_reclaim_source_missing")?;
+    let registered_source = child
+        .managed_source
+        .as_deref()
+        .ok_or("managed_reclaim_lineage_incomplete")?;
+    if !paths_equal(Path::new(registered_source), &source)
+        || child.managed_source_root_fingerprint.as_deref()
+            != Some(project_root_fingerprint(&source).as_str())
+    {
+        return Err("managed_reclaim_source_fingerprint_mismatch");
+    }
+    let child_path = canonicalize_existing(Path::new(&child.path))
+        .map_err(|_| "managed_reclaim_worktree_missing")?;
+    if paths_equal(&child_path, &source)
+        || child_path.parent().is_none()
+        || child.managed_base_sha.as_deref().is_none_or(|sha| {
+            !matches!(sha.len(), 40 | 64) || !sha.bytes().all(|c| c.is_ascii_hexdigit())
+        })
+    {
+        return Err("managed_reclaim_lineage_incomplete");
+    }
+    managed_worktree_local_git_reclaim_gate(
+        &source,
+        &child_path,
+        child.managed_base_sha.as_deref().expect("checked above"),
+    )
+}
+
 pub(super) fn managed_worktree_local_git_reclaim_gate(
     source: &Path,
     worktree: &Path,
