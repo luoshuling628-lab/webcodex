@@ -265,7 +265,6 @@ fn source_mentions_worktree_path(source: &Path, worktree: &Path) -> Result<bool,
         .any(|path| paths_equal(Path::new(path), worktree)))
 }
 
-
 /**
  * Runner-local, read-only Git admission for a freshly managed worktree.
  *
@@ -285,8 +284,8 @@ pub(super) fn managed_worktree_local_git_reclaim_gate(
     {
         return Err("managed_reclaim_invalid_expected_head");
     }
-    let metadata = std::fs::symlink_metadata(worktree)
-        .map_err(|_| "managed_reclaim_worktree_missing")?;
+    let metadata =
+        std::fs::symlink_metadata(worktree).map_err(|_| "managed_reclaim_worktree_missing")?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err("managed_reclaim_worktree_unsafe_path");
     }
