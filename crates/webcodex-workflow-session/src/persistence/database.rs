@@ -107,11 +107,93 @@ impl SessionDatabase {
              );
              CREATE TABLE IF NOT EXISTS workflow_session_tombstones (
                  session_id TEXT PRIMARY KEY, payload TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS workflow_managed_closeout_fences (
+                 project TEXT PRIMARY KEY NOT NULL,
+                 operation_id TEXT NOT NULL CHECK(length(operation_id) BETWEEN 1 AND 128)
              );",
         ).map_err(error)?;
         Ok(Arc::new(Self {
             connection: Mutex::new(connection),
         }))
+    }
+
+    /// Durable fail-closed closeout reservations. These remain after a Server
+    /// restart or cancellation until an independently verified terminal
+    /// reconciliation explicitly releases the exact operation.
+    pub(crate) fn managed_closeout_fences(
+        &self,
+    ) -> io::Result<std::collections::BTreeMap<String, String>> {
+        let connection = self.connection.lock().map_err(error)?;
+        let mut query = connection.prepare(
+            "SELECT project, operation_id FROM workflow_managed_closeout_fences ORDER BY project",
+        ).map_err(error)?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(error)?;
+        let mut fences = std::collections::BTreeMap::new();
+        for row in rows {
+            let (project, operation) = row.map_err(error)?;
+            if project.is_empty()
+                || operation.is_empty()
+                || fences.insert(project, operation).is_some()
+            {
+                return Err(error("corrupt durable closeout fence"));
+            }
+        }
+        Ok(fences)
+    }
+
+    /// Atomic idempotent reservation; a conflicting operation must not take
+    /// over an earlier closeout in progress.
+    pub(crate) fn reserve_managed_closeout(
+        &self,
+        project: &str,
+        operation_id: &str,
+    ) -> io::Result<()> {
+        if project.is_empty() || operation_id.is_empty() || operation_id.len() > 128 {
+            return Err(error("invalid durable closeout identity"));
+        }
+        let connection = self.connection.lock().map_err(error)?;
+        connection.execute(
+            "INSERT OR IGNORE INTO workflow_managed_closeout_fences(project,operation_id) VALUES(?1,?2)",
+            params![project, operation_id],
+        ).map_err(error)?;
+        let saved: String = connection
+            .query_row(
+                "SELECT operation_id FROM workflow_managed_closeout_fences WHERE project=?1",
+                params![project],
+                |row| row.get(0),
+            )
+            .map_err(error)?;
+        if saved != operation_id {
+            return Err(error("durable_closeout_operation_conflict"));
+        }
+        Ok(())
+    }
+
+    /// Only terminal reconciliation may call this, after checking the exact
+    /// Runner identity and terminal receipt. The row count protects CAS.
+    /// The release path is intentionally not wired until that proof exists.
+    #[allow(dead_code)]
+    pub(crate) fn release_managed_closeout(
+        &self,
+        project: &str,
+        operation_id: &str,
+    ) -> io::Result<()> {
+        let connection = self.connection.lock().map_err(error)?;
+        let count = connection
+            .execute(
+                "DELETE FROM workflow_managed_closeout_fences WHERE project=?1 AND operation_id=?2",
+                params![project, operation_id],
+            )
+            .map_err(error)?;
+        if count != 1 {
+            return Err(error("durable_closeout_release_conflict"));
+        }
+        Ok(())
     }
 
     pub(crate) fn write(&self, writes: &[SessionWrite]) -> io::Result<u64> {

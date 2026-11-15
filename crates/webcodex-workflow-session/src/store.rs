@@ -164,7 +164,9 @@ impl Drop for SessionProjectUnregisterGuard {
             .inner
             .lock()
             .expect("session store mutex poisoned");
-        inner.unregistering_projects.remove(&self.project);
+        if !inner.durable_closeout_projects.contains_key(&self.project) {
+            inner.unregistering_projects.remove(&self.project);
+        }
     }
 }
 
@@ -173,6 +175,7 @@ pub(super) struct SessionStoreInner {
     /// Durable workflow sessions. Mutated only via the helpers below.
     sessions: SessionRecords,
     unregistering_projects: BTreeSet<String>,
+    durable_closeout_projects: BTreeMap<String, String>,
     lru: SessionRecency,
     hot_session_capacity_target: usize,
     cache_target_bytes: usize,
@@ -209,6 +212,7 @@ impl SessionStore {
             inner: Arc::new(Mutex::new(SessionStoreInner {
                 sessions: SessionRecords::default(),
                 unregistering_projects: BTreeSet::new(),
+                durable_closeout_projects: BTreeMap::new(),
                 lru: SessionRecency::default(),
                 hot_session_capacity_target,
                 cache_target_bytes: DEFAULT_SESSION_CACHE_BYTES,
@@ -299,12 +303,15 @@ impl SessionStore {
             tombstones.insert(ordinal, tombstone);
         }
         let restored_sessions = sessions.len();
+        let durable_closeout_projects = database.managed_closeout_fences()?;
+        let durable_closeout_blocked = durable_closeout_projects.keys().cloned().collect();
         let inner = Arc::new(Mutex::new(SessionStoreInner {
             sessions: SessionRecords {
                 generation,
                 ..SessionRecords::restored(sessions)
             },
-            unregistering_projects: BTreeSet::new(),
+            unregistering_projects: durable_closeout_blocked,
+            durable_closeout_projects,
             lru,
             hot_session_capacity_target: DEFAULT_MAX_SESSIONS,
             cache_target_bytes,
@@ -978,6 +985,78 @@ impl SessionStore {
         project: &str,
     ) -> Result<SessionProjectUnregisterGuard, String> {
         self.begin_project_retirement_fence(project, false)
+    }
+
+    /// Reserve one durable exact managed closeout in the existing SQLite
+    /// Session domain before the Server submits any Runner removal request.
+    /// A restart restores the block before accepting new Sessions. Unlike the
+    /// transient SessionProjectUnregisterGuard, this reservation is NOT removed
+    /// on Drop, timeout or cancellation. It awaits exact terminal reconciliation.
+    pub fn reserve_durable_managed_worktree_closeout(
+        &self,
+        project: &str,
+        operation_id: &str,
+    ) -> Result<(), String> {
+        if project.is_empty()
+            || operation_id.is_empty()
+            || operation_id.len() > 128
+            || !operation_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("invalid_durable_closeout_identity".to_string());
+        }
+        let mut inner = self.inner.lock().map_err(|_| "session_store_unavailable")?;
+        if let Some(current) = inner.durable_closeout_projects.get(project) {
+            return if current == operation_id {
+                Ok(())
+            } else {
+                Err("durable_closeout_operation_conflict".to_string())
+            };
+        }
+        if inner.unregistering_projects.contains(project) {
+            return Err("project_retirement_already_in_progress".to_string());
+        }
+        let mut closed_count = 0_usize;
+        for record in inner.sessions.values() {
+            if record.project() != Some(project) {
+                continue;
+            }
+            match record.lifecycle() {
+                SessionLifecycle::Active => {
+                    return Err("managed_worktree_active_sessions".to_string())
+                }
+                SessionLifecycle::Closed => closed_count += 1,
+            }
+        }
+        if closed_count == 0 {
+            return Err("managed_worktree_no_closed_sessions".to_string());
+        }
+        let db = inner
+            .persistence
+            .as_ref()
+            .ok_or_else(|| "durable_closeout_requires_database".to_string())?
+            .database
+            .clone();
+        // Install in-memory exclusion before SQLite mutation under the
+        // Session creation mutex. If the database commit acknowledgement is
+        // indeterminate, keep the project blocked until independent recovery.
+        inner.unregistering_projects.insert(project.to_string());
+        if db.reserve_managed_closeout(project, operation_id).is_err() {
+            return Err("durable_closeout_persistence_uncertain".to_string());
+        }
+        inner
+            .durable_closeout_projects
+            .insert(project.to_string(), operation_id.to_string());
+        Ok(())
+    }
+
+    /// Read-only cold-restart reconciliation hint. Does not release or
+    /// transfer authority; a matching operation still needs a verified Runner
+    /// terminal receipt before the durable block may be cleared.
+    pub fn durable_managed_worktree_closeout(&self, project: &str) -> Option<String> {
+        let inner = self.inner.lock().ok()?;
+        inner.durable_closeout_projects.get(project).cloned()
     }
 
     /// Dedicated Session-side gate for *automatic managed-worktree cleanup*.

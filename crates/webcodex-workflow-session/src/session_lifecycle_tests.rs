@@ -53,6 +53,71 @@ fn session_tool_contract(tool_name: &str) -> SessionToolContract {
 }
 
 #[test]
+fn native_closeout_durable_reservation_survives_restart_and_blocks_new_sessions() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("managed-closeout.json");
+    let store = persistent_store(ledger.clone());
+    let session = store.start_session_with_guards(
+        Some("agent:runner:managed-child".into()),
+        Some("closeout fixture".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    assert_eq!(
+        store
+            .reserve_durable_managed_worktree_closeout("agent:runner:managed-child", "operation-1")
+            .unwrap_err(),
+        "managed_worktree_active_sessions"
+    );
+    store.close_session(&session.session_id).unwrap();
+    store.flush_persistence();
+    store
+        .reserve_durable_managed_worktree_closeout("agent:runner:managed-child", "operation-1")
+        .unwrap();
+    assert_eq!(
+        store
+            .reserve_durable_managed_worktree_closeout("agent:runner:managed-child", "operation-2")
+            .unwrap_err(),
+        "durable_closeout_operation_conflict"
+    );
+    assert_eq!(
+        store.durable_managed_worktree_closeout("agent:runner:managed-child"),
+        Some("operation-1".into())
+    );
+    drop(store);
+    let restored = persistent_store(ledger);
+    assert_eq!(
+        restored.durable_managed_worktree_closeout("agent:runner:managed-child"),
+        Some("operation-1".into())
+    );
+    assert_eq!(
+        restored
+            .reserve_durable_managed_worktree_closeout("agent:runner:managed-child", "operation-1"),
+        Ok(())
+    );
+    assert_eq!(
+        restored
+            .reserve_durable_managed_worktree_closeout("agent:runner:managed-child", "operation-2")
+            .unwrap_err(),
+        "durable_closeout_operation_conflict"
+    );
+    let outcome = restored.start_session_with_options(crate::SessionCreateOptions::new(
+        Some("agent:runner:managed-child".into()),
+        Some("should not reopen".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    ));
+    assert!(outcome.is_err());
+    let other = restored.start_session_with_guards(
+        Some("agent:runner:unrelated".into()),
+        Some("unrelated".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    assert_eq!(other.project.as_deref(), Some("agent:runner:unrelated"));
+}
+
+#[test]
 fn ledger_round_trip_preserves_session_state_events_and_messages() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("sessions.json");
