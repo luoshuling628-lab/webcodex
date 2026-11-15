@@ -433,7 +433,10 @@ fn managed_worktree_cleanup_fence_blocks_active_session_and_racing_creation() {
     // the target still owns a live Session. A rejected attempt must not
     // permanently block normal Session creation or closure.
     assert_eq!(
-        store.begin_managed_worktree_cleanup_fence(project).err().as_deref(),
+        store
+            .begin_managed_worktree_cleanup_fence(project)
+            .err()
+            .as_deref(),
         Some("managed_worktree_active_sessions")
     );
     assert_eq!(store.retained_project_session_counts(project), (1, 0));
@@ -449,7 +452,10 @@ fn managed_worktree_cleanup_fence_blocks_active_session_and_racing_creation() {
         .begin_managed_worktree_cleanup_fence(project)
         .expect("all exact project sessions must be closed");
     assert_eq!(store.retained_project_session_counts(project), (0, 2));
-    assert_eq!(store.retained_project_session_counts("agent:ruoshui:unrelated"), (1, 0));
+    assert_eq!(
+        store.retained_project_session_counts("agent:ruoshui:unrelated"),
+        (1, 0)
+    );
     assert!(store.begin_project_unregister_fence(project).is_err());
     let racing = store.start_session_with_options(crate::SessionCreateOptions::new(
         Some(project.to_string()),
