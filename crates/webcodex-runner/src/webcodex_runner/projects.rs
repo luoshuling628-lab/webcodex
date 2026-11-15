@@ -244,6 +244,77 @@ mod durability_tests {
         );
     }
 
+    #[test]
+    fn native_managed_worktree_git_reclaim_gate_preserves_unique_data() {
+        use super::managed_worktree::managed_worktree_local_git_reclaim_gate;
+        use std::process::Command;
+
+        fn git(root: &Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git available in native Runner test");
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let child = temp.path().join("new-worktree");
+        std::fs::create_dir(&source).unwrap();
+        git(&source, &["init"]);
+        git(&source, &["config", "user.name", "Managed Fixture"]);
+        git(&source, &["config", "user.email", "fixture@example.invalid"]);
+        std::fs::write(source.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(source.join("tracked.txt"), "commit one\n").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "first"]);
+        std::fs::write(source.join("tracked.txt"), "commit two\n").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "second"]);
+        let sha = git(&source, &["rev-parse", "HEAD"]);
+        let child_cli = super::managed_worktree::managed_worktree_git_cli_path(&child);
+        git(&source, &["worktree", "add", "--detach", &child_cli, "HEAD"]);
+        assert_eq!(
+            managed_worktree_local_git_reclaim_gate(&source, &child, &sha),
+            Ok(())
+        );
+        assert_eq!(
+            managed_worktree_local_git_reclaim_gate(&source, &child, "not-a-sha"),
+            Err("managed_reclaim_invalid_expected_head")
+        );
+        std::fs::write(child.join("unique.txt"), "do not lose me").unwrap();
+        assert_eq!(
+            managed_worktree_local_git_reclaim_gate(&source, &child, &sha),
+            Err("managed_reclaim_unique_content")
+        );
+        std::fs::remove_file(child.join("unique.txt")).unwrap();
+        std::fs::write(child.join("ignored.txt"), "also unique").unwrap();
+        assert_eq!(
+            managed_worktree_local_git_reclaim_gate(&source, &child, &sha),
+            Err("managed_reclaim_ignored_content")
+        );
+        std::fs::remove_file(child.join("ignored.txt")).unwrap();
+        let git_dir = git(&child, &["rev-parse", "--absolute-git-dir"]);
+        std::fs::write(Path::new(&git_dir).join("locked"), "do not remove").unwrap();
+        assert_eq!(
+            managed_worktree_local_git_reclaim_gate(&source, &child, &sha),
+            Err("managed_reclaim_locked")
+        );
+        std::fs::remove_file(Path::new(&git_dir).join("locked")).unwrap();
+        git(&child, &["reset", "--hard", "HEAD~1"]);
+        assert_eq!(
+            managed_worktree_local_git_reclaim_gate(&source, &child, &sha),
+            Err("managed_reclaim_head_drift")
+        );
+    }
+
     /// Unix-only: verifies the POSIX directory-fsync contract (opening a
     /// directory as a file). On Windows directory sync is intentionally
     /// skipped because std cannot open directories with the required
