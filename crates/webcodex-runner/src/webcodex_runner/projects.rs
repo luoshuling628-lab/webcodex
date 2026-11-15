@@ -37,6 +37,72 @@ pub(crate) use lifecycle::{handle_project_lifecycle_operation, handle_project_op
 
 pub(crate) use managed_worktree::handle_prepare_managed_worktree_operation;
 
+/// Execute only after the Server owns its continuously held native Session
+/// and Job-start closeout fences. This Runner-side exclusion closes both
+/// local managed admission races; no public transport operation is exposed
+/// until the Server↔Runner lease and crash-reconciliation protocol is bound.
+#[allow(dead_code)]
+/// Dedicated native Runner transport effect. An ordinary project lifecycle
+/// tool never selects this operation; only the Server Native Closeout Owner
+/// may enqueue it while retaining its own durable Session/Job fences.
+#[allow(dead_code)]
+pub(crate) fn handle_native_managed_closeout_operation(
+    policy: &super::config::RunnerPolicy,
+    registry: &std::path::Path,
+    jobs: &super::job_manager::JobManager,
+    shells: &super::persistent_shell::PersistentShellManager,
+    operation: &webcodex_core::runner_operation::RunnerProjectOperation,
+) -> CommandResult {
+    let start = Instant::now();
+    if operation.kind
+        != webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseout
+        || operation.payload.len() > 8192
+    {
+        return project_error_cmd(start, "native_closeout_invalid_request");
+    }
+    let candidate: native_closeout::NativeCloseoutRecord =
+        match serde_json::from_str(&operation.payload) {
+            Ok(candidate) => candidate,
+            Err(_) => return project_error_cmd(start, "native_closeout_invalid_request"),
+        };
+    let project_id = candidate.project_id.clone();
+    match execute_native_closeout_under_runner_fences(policy, registry, jobs, shells, candidate) {
+        Ok(receipt) => crate::webcodex_runner::output::ok_cmd(
+            start,
+            serde_json::json!({
+                "operation": "native_managed_closeout",
+                "outcome": "native_closeout_completed",
+                "changed": true,
+                "agent_project_id": project_id,
+                "operation_id": receipt.operation_id,
+                "expected_revision": receipt.expected_revision,
+                "registration_incarnation": receipt.expected_incarnation,
+                "phase": receipt.phase,
+            }),
+        ),
+        Err(reason) => structured_project_error_cmd(
+            start,
+            reason,
+            true, // Treat any failure as potentially partially committed.
+            serde_json::json!({"operation": "native_managed_closeout"}),
+        ),
+    }
+}
+
+pub(crate) fn execute_native_closeout_under_runner_fences(
+    policy: &super::config::RunnerPolicy,
+    registry: &std::path::Path,
+    jobs: &super::job_manager::JobManager,
+    shells: &super::persistent_shell::PersistentShellManager,
+    candidate: native_closeout::NativeCloseoutRecord,
+) -> Result<native_closeout::NativeCloseoutRecord, &'static str> {
+    jobs.with_quiescent_job_admission(|| {
+        shells.with_quiescent_shell_admission(|| {
+            native_closeout::execute_under_verified_owner(policy, registry, candidate)
+        })
+    })
+}
+
 #[cfg(test)]
 use registration::build_project_toml;
 pub(crate) use registration::handle_resolve_or_register_project_operation;

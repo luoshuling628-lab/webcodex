@@ -464,6 +464,7 @@ pub enum RunnerProjectOperationKind {
     Create,
     ResolveOrRegister,
     PrepareManagedWorktree,
+    NativeManagedCloseout,
     LifecycleEnable,
     LifecycleDisable,
     LifecycleUnregister,
@@ -477,6 +478,7 @@ impl RunnerProjectOperationKind {
             Self::Create => "create_project",
             Self::ResolveOrRegister => "resolve_or_register_project",
             Self::PrepareManagedWorktree => "prepare_managed_worktree",
+            Self::NativeManagedCloseout => "native_managed_closeout",
             Self::LifecycleEnable => "project_lifecycle_enable",
             Self::LifecycleDisable => "project_lifecycle_disable",
             Self::LifecycleUnregister => "project_lifecycle_unregister",
@@ -490,6 +492,7 @@ impl RunnerProjectOperationKind {
             "create_project" => Self::Create,
             "resolve_or_register_project" => Self::ResolveOrRegister,
             "prepare_managed_worktree" => Self::PrepareManagedWorktree,
+            "native_managed_closeout" => Self::NativeManagedCloseout,
             "project_lifecycle_enable" => Self::LifecycleEnable,
             "project_lifecycle_disable" => Self::LifecycleDisable,
             "project_lifecycle_unregister" => Self::LifecycleUnregister,
@@ -499,7 +502,10 @@ impl RunnerProjectOperationKind {
     }
 
     pub fn disables_execution(self) -> bool {
-        matches!(self, Self::LifecycleDisable | Self::LifecycleUnregister)
+        matches!(
+            self,
+            Self::LifecycleDisable | Self::LifecycleUnregister | Self::NativeManagedCloseout
+        )
     }
 }
 
@@ -2486,6 +2492,19 @@ fn ensure_empty_generic_execution_fields(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn native_managed_closeout_is_distinct_and_disables_execution() {
+        use super::*;
+        let kind = RunnerProjectOperationKind::NativeManagedCloseout;
+        assert_eq!(kind.wire_kind(), "native_managed_closeout");
+        assert_eq!(
+            RunnerProjectOperationKind::from_wire(kind.wire_kind()),
+            Some(kind)
+        );
+        assert!(kind.disables_execution());
+        assert_ne!(kind, RunnerProjectOperationKind::LifecycleUnregister);
+    }
+
+    #[test]
     fn computer_control_epoch_roundtrips_only_on_effects_and_is_omitted_for_legacy_requests() {
         let metadata = RunnerInvocationMetadata {
             request_id: "request".into(),
@@ -3451,6 +3470,7 @@ mod tests {
             RunnerProjectOperationKind::Create,
             RunnerProjectOperationKind::ResolveOrRegister,
             RunnerProjectOperationKind::PrepareManagedWorktree,
+            RunnerProjectOperationKind::NativeManagedCloseout,
             RunnerProjectOperationKind::LifecycleEnable,
             RunnerProjectOperationKind::LifecycleDisable,
             RunnerProjectOperationKind::LifecycleUnregister,

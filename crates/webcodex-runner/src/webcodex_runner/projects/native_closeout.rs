@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum CloseoutPhase {
+pub(crate) enum CloseoutPhase {
     Prepared,
     GitRemoved,
     Unregistered,
@@ -19,7 +19,7 @@ pub(super) enum CloseoutPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct NativeCloseoutRecord {
+pub(crate) struct NativeCloseoutRecord {
     pub operation_id: String,
     pub project_id: String,
     pub expected_revision: String,
@@ -393,25 +393,55 @@ mod tests {
             ..Default::default()
         };
 
+        let jobs = super::super::super::job_manager::JobManager::new(1);
+        let shells = super::super::super::persistent_shell::PersistentShellManager::new(
+            &super::super::super::config::ShellConfig::default(),
+            super::super::super::ssh::SshConnectionPool::default(),
+        );
+
         fs::write(child.join("unique.txt"), "do not delete").unwrap();
         assert_eq!(
-            execute_under_verified_owner(&policy, &registry, candidate.clone()).unwrap_err(),
+            super::super::execute_native_closeout_under_runner_fences(
+                &policy,
+                &registry,
+                &jobs,
+                &shells,
+                candidate.clone()
+            )
+            .unwrap_err(),
             "managed_reclaim_unique_content"
         );
         assert!(child.join("unique.txt").exists());
         fs::remove_file(child.join("unique.txt")).unwrap();
-        let done = execute_under_verified_owner(&policy, &registry, candidate.clone()).unwrap();
+        let done = super::super::execute_native_closeout_under_runner_fences(
+            &policy,
+            &registry,
+            &jobs,
+            &shells,
+            candidate.clone(),
+        )
+        .unwrap();
         assert_eq!(done.phase, CloseoutPhase::Unregistered);
         assert!(!child.exists());
         assert!(!registry.join("fixture-child.toml").exists());
         assert_eq!(
-            execute_under_verified_owner(&policy, &registry, candidate.clone()).unwrap(),
+            super::super::execute_native_closeout_under_runner_fences(
+                &policy,
+                &registry,
+                &jobs,
+                &shells,
+                candidate.clone()
+            )
+            .unwrap(),
             done
         );
         let mut conflict = candidate;
         conflict.expected_head = "b".repeat(40);
         assert_eq!(
-            execute_under_verified_owner(&policy, &registry, conflict).unwrap_err(),
+            super::super::execute_native_closeout_under_runner_fences(
+                &policy, &registry, &jobs, &shells, conflict
+            )
+            .unwrap_err(),
             "native_closeout_idempotency_conflict"
         );
     }

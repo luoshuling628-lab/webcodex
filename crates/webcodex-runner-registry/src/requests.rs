@@ -2445,6 +2445,7 @@ impl RunnerRegistry {
                 | "create_project"
                 | "resolve_or_register_project"
                 | "prepare_managed_worktree"
+                | "native_managed_closeout"
                 | "project_lifecycle_enable"
                 | "project_lifecycle_disable"
                 | "project_lifecycle_unregister"
@@ -2458,6 +2459,7 @@ impl RunnerRegistry {
         let required_feature = match kind {
             "resolve_or_register_project" => Some(RunnerFeature::ProjectPathRegistration),
             "prepare_managed_worktree" => Some(RunnerFeature::ManagedWorktree),
+            "native_managed_closeout" => Some(RunnerFeature::NativeManagedCloseout),
             "project_lifecycle_enable"
             | "project_lifecycle_disable"
             | "project_lifecycle_unregister" => Some(RunnerFeature::ProjectLifecycle),
