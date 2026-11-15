@@ -236,9 +236,11 @@ impl ToolRuntime {
                 reason = Some("runner_disconnected");
             }
             if reason.is_none()
-                && !client.view.project_inventory.as_ref().is_some_and(|inventory| {
-                    inventory.sync_state == "complete"
-                })
+                && !client
+                    .view
+                    .project_inventory
+                    .as_ref()
+                    .is_some_and(|inventory| inventory.sync_state == "complete")
             {
                 reason = Some("runner_inventory_incomplete");
             }
@@ -304,15 +306,15 @@ mod native_cleanup_preview_tests {
             "root_fingerprint":"wc_projroot_example",
             "revision": format!("sha256:{}", "a".repeat(64)),
             "git_dirty": false,"git_head": "0123456789012345678901234567890123456789"
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(native_cleanup_identity_blocker(&project), None);
         project.registration_incarnation = None;
         assert_eq!(
             native_cleanup_identity_blocker(&project),
             Some("managed_worktree_identity_incomplete")
         );
-        project.registration_incarnation =
-            Some("11111111-1111-4111-8111-111111111111".to_string());
+        project.registration_incarnation = Some("11111111-1111-4111-8111-111111111111".to_string());
         project.git_dirty = None;
         assert_eq!(
             native_cleanup_identity_blocker(&project),
