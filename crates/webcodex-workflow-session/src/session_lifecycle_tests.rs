@@ -433,8 +433,8 @@ fn managed_worktree_cleanup_fence_blocks_active_session_and_racing_creation() {
     // the target still owns a live Session. A rejected attempt must not
     // permanently block normal Session creation or closure.
     assert_eq!(
-        store.begin_managed_worktree_cleanup_fence(project).unwrap_err(),
-        "managed_worktree_active_sessions"
+        store.begin_managed_worktree_cleanup_fence(project).err().as_deref(),
+        Some("managed_worktree_active_sessions")
     );
     assert_eq!(store.retained_project_session_counts(project), (1, 0));
     let another = store.start_session(
