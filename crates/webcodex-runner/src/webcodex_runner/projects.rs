@@ -291,6 +291,49 @@ mod durability_tests {
             managed_worktree_local_git_reclaim_gate(&source, &child, &sha),
             Ok(())
         );
+        let source_project: RunnerProjectFile = serde_json::from_value(serde_json::json!({
+            "id":"fixture-source", "path": source.to_string_lossy()
+        })).unwrap();
+        let mut managed: RunnerProjectFile = serde_json::from_value(serde_json::json!({
+            "id":"fixture-child","path":child.to_string_lossy(),
+            "registration_source":"auto_registered", "managed_worktree":true,
+            "registration_incarnation":"11111111-1111-4111-8111-111111111111",
+            "managed_operation_id":"22222222-2222-4222-8222-222222222222",
+            "managed_source":source.to_string_lossy(),
+            "managed_source_project_id":"fixture-source",
+            "managed_source_root_fingerprint":project_root_fingerprint(&source),
+            "managed_base_sha":sha
+        })).unwrap();
+        assert_eq!(
+            super::managed_worktree::managed_worktree_reclaim_lineage_gate(
+                &managed, &source_project
+            ),
+            Ok(())
+        );
+        managed.managed_source_project_id = Some("foreign-source".to_owned());
+        assert_eq!(
+            super::managed_worktree::managed_worktree_reclaim_lineage_gate(
+                &managed, &source_project
+            ),
+            Err("managed_reclaim_source_project_mismatch")
+        );
+        managed.managed_source_project_id = Some("fixture-source".to_owned());
+        managed.managed_source_root_fingerprint = Some("wrong-fingerprint".to_owned());
+        assert_eq!(
+            super::managed_worktree::managed_worktree_reclaim_lineage_gate(
+                &managed, &source_project
+            ),
+            Err("managed_reclaim_source_fingerprint_mismatch")
+        );
+        managed.managed_source_root_fingerprint = Some(project_root_fingerprint(&source));
+        managed.registration_incarnation = Some("not-a-uuid".to_owned());
+        assert_eq!(
+            super::managed_worktree::managed_worktree_reclaim_lineage_gate(
+                &managed, &source_project
+            ),
+            Err("managed_reclaim_registration_identity_invalid")
+        );
+
         assert_eq!(
             managed_worktree_local_git_reclaim_gate(&source, &child, "not-a-sha"),
             Err("managed_reclaim_invalid_expected_head")
