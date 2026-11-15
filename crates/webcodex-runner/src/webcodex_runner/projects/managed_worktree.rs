@@ -265,6 +265,76 @@ fn source_mentions_worktree_path(source: &Path, worktree: &Path) -> Result<bool,
         .any(|path| paths_equal(Path::new(path), worktree)))
 }
 
+
+/**
+ * Runner-local, read-only Git admission for a freshly managed worktree.
+ *
+ * The Server inventory is not sufficient: it can lag behind files created
+ * after the last Runner snapshot. This is intentionally NOT a deletion
+ * permission, and does not prove GitHub recovery, live-process leases or
+ * successful Project CAS unregister. Call only under the trusted native
+ * closeout Owner after verifying exact managed registration identity.
+ */
+pub(super) fn managed_worktree_local_git_reclaim_gate(
+    source: &Path,
+    worktree: &Path,
+    expected_head: &str,
+) -> Result<(), &'static str> {
+    if !matches!(expected_head.len(), 40 | 64)
+        || !expected_head.bytes().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err("managed_reclaim_invalid_expected_head");
+    }
+    let metadata = std::fs::symlink_metadata(worktree)
+        .map_err(|_| "managed_reclaim_worktree_missing")?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("managed_reclaim_worktree_unsafe_path");
+    }
+    if paths_equal(source, worktree) || !source_mentions_worktree_path(source, worktree)? {
+        return Err("managed_reclaim_source_binding_mismatch");
+    }
+    let head = managed_worktree_git_text(worktree, &["rev-parse", "--verify", "HEAD"])?;
+    if !head.eq_ignore_ascii_case(expected_head) {
+        return Err("managed_reclaim_head_drift");
+    }
+    let dirty = managed_worktree_git_text(
+        worktree,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    if !dirty.is_empty() {
+        return Err("managed_reclaim_unique_content");
+    }
+    let ignored = managed_worktree_git_text(
+        worktree,
+        &["ls-files", "--others", "--ignored", "--exclude-standard"],
+    )?;
+    if !ignored.is_empty() {
+        return Err("managed_reclaim_ignored_content");
+    }
+    // Detached HEAD is mandatory; do not dispose a unique local branch tip.
+    let branch = run_git_bounded(
+        worktree,
+        &["symbolic-ref", "--quiet", "HEAD"],
+        MANAGED_WORKTREE_GIT_TIMEOUT,
+        None,
+    )
+    .map_err(|_| "managed_reclaim_git_state_unverified")?;
+    if branch.stdout_capped || branch.stderr_capped || branch.status.code() != Some(1) {
+        return Err("managed_reclaim_branch_or_git_state");
+    }
+    let git_dir = managed_worktree_git_text(worktree, &["rev-parse", "--absolute-git-dir"])?;
+    let git_dir = Path::new(&git_dir);
+    if !git_dir.is_dir() {
+        return Err("managed_reclaim_gitdir_unverified");
+    }
+    if git_dir.join("locked").exists() {
+        return Err("managed_reclaim_locked");
+    }
+    // A fresh query of an owner-bound local source is NOT a remote GitHub
+    // durability proof. The separate authenticated executor must require it.
+    Ok(())
+}
+
 fn managed_worktree_project_toml(
     id: &str,
     name: &str,
