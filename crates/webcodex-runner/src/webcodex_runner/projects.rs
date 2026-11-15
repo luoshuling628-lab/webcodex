@@ -270,7 +270,10 @@ mod durability_tests {
         std::fs::create_dir(&source).unwrap();
         git(&source, &["init"]);
         git(&source, &["config", "user.name", "Managed Fixture"]);
-        git(&source, &["config", "user.email", "fixture@example.invalid"]);
+        git(
+            &source,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
         std::fs::write(source.join(".gitignore"), "ignored.txt\n").unwrap();
         std::fs::write(source.join("tracked.txt"), "commit one\n").unwrap();
         git(&source, &["add", "."]);
@@ -280,7 +283,10 @@ mod durability_tests {
         git(&source, &["commit", "-m", "second"]);
         let sha = git(&source, &["rev-parse", "HEAD"]);
         let child_cli = super::managed_worktree::managed_worktree_git_cli_path(&child);
-        git(&source, &["worktree", "add", "--detach", &child_cli, "HEAD"]);
+        git(
+            &source,
+            &["worktree", "add", "--detach", &child_cli, "HEAD"],
+        );
         assert_eq!(
             managed_worktree_local_git_reclaim_gate(&source, &child, &sha),
             Ok(())
