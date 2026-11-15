@@ -22,6 +22,7 @@ mod catalog;
 mod created_paths;
 mod lifecycle;
 mod managed_worktree;
+mod native_closeout;
 mod registration;
 
 pub(crate) use catalog::load_runner_project_metadata;
