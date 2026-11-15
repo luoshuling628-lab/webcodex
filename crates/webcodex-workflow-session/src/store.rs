@@ -1004,12 +1004,22 @@ impl SessionStore {
         if inner.unregistering_projects.contains(project) {
             return Err("project_retirement_already_in_progress".to_string());
         }
-        if require_all_closed
-            && inner.sessions.values().any(|record| {
-                record.project() == Some(project) && record.lifecycle() == SessionLifecycle::Active
-            })
-        {
-            return Err("managed_worktree_active_sessions".to_string());
+        if require_all_closed {
+            let mut closed_count = 0usize;
+            for record in inner.sessions.values() {
+                if record.project() != Some(project) {
+                    continue;
+                }
+                match record.lifecycle() {
+                    SessionLifecycle::Active => {
+                        return Err("managed_worktree_active_sessions".to_string());
+                    }
+                    SessionLifecycle::Closed => closed_count += 1,
+                }
+            }
+            if closed_count == 0 {
+                return Err("managed_worktree_no_closed_sessions".to_string());
+            }
         }
         inner.unregistering_projects.insert(project.to_string());
         Ok(SessionProjectUnregisterGuard {
