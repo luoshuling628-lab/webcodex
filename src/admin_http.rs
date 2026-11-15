@@ -1,6 +1,6 @@
 use crate::admin_project_lifecycle::{
     AdminProjectLifecycleService, CreateProjectRequest, ProjectMutationRequest,
-    RegisterProjectRequest, ServiceResponse, UpdateProjectAllowPatchRequest,
+    NativeCloseoutAdmissionRequest, RegisterProjectRequest, ServiceResponse, UpdateProjectAllowPatchRequest,
 };
 use crate::auth::{AuthContext, AuthKind};
 use crate::tool_runtime::activity::ActivityVisibility;
