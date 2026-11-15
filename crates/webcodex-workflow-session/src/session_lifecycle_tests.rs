@@ -417,6 +417,38 @@ fn retained_project_session_counts_are_exact_and_cover_all_lifecycles() {
 }
 
 #[test]
+fn managed_worktree_cleanup_fence_requires_exact_closed_session() {
+    let store = SessionStore::default();
+    let project = "agent:ruoshui:new-managed";
+    assert_eq!(
+        store
+            .begin_managed_worktree_cleanup_fence(project)
+            .err()
+            .as_deref(),
+        Some("managed_worktree_no_closed_sessions")
+    );
+    let foreign = store.start_session(
+        Some("agent:ruoshui:foreign".to_string()),
+        Some("foreign only".to_string()),
+    );
+    store.close_session(&foreign.session_id).unwrap();
+    assert_eq!(
+        store
+            .begin_managed_worktree_cleanup_fence(project)
+            .err()
+            .as_deref(),
+        Some("managed_worktree_no_closed_sessions")
+    );
+    let own = store.start_session(Some(project.to_string()), Some("exact".to_string()));
+    store.close_session(&own.session_id).unwrap();
+    let guard = store
+        .begin_managed_worktree_cleanup_fence(project)
+        .expect("one exact closed Session is required");
+    assert_eq!(store.retained_project_session_counts(project), (0, 1));
+    drop(guard);
+}
+
+#[test]
 fn managed_worktree_cleanup_fence_blocks_active_session_and_racing_creation() {
     let store = SessionStore::default();
     let project = "agent:ruoshui:managed-new";
