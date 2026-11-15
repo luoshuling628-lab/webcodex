@@ -31,6 +31,10 @@ pub(crate) fn routes() -> Router {
         .push(
             Router::with_path(api_path(RouteId::AdminProjectsUnregister)).post(unregister_project),
         )
+        .push(
+            Router::with_path(api_path(RouteId::AdminProjectsNativeCloseoutAdmission))
+                .post(native_closeout_admission),
+        )
 }
 
 fn error(res: &mut Response, status: StatusCode, message: &str) {
@@ -311,6 +315,19 @@ async fn disable_project(req: &mut Request, depot: &mut Depot, res: &mut Respons
 #[handler]
 async fn unregister_project(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     mutate_project("unregister", req, depot, res).await;
+}
+
+#[handler]
+async fn native_closeout_admission(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (auth, service) = match lifecycle_context(req, depot).await {
+        Ok(value) => value,
+        Err(response) => return render_service_response(res, response),
+    };
+    let body = match parse_admin_json::<NativeCloseoutAdmissionRequest>(req).await {
+        Ok(value) => value,
+        Err(response) => return render_service_response(res, response),
+    };
+    render_service_response(res, service.native_closeout_admission(&auth, body).await);
 }
 
 #[handler]
