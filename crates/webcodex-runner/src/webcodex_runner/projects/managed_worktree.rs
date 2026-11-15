@@ -449,6 +449,49 @@ pub(super) fn managed_worktree_remote_exact_ref_gate(
     Ok(())
 }
 
+/// The filesystem step of an admitted native closeout, not a public
+/// operation. The Server must retain both Runner Job and Session fences and
+/// the Runner caller must own the exact registration CAS and durable journal
+/// for the whole transaction before invoking this step.
+#[allow(dead_code)]
+pub(super) fn managed_worktree_normal_remove_after_gates(
+    source: &Path,
+    worktree: &Path,
+    expected_sha: &str,
+    expected_origin_url: &str,
+    remote_branch_ref: &str,
+) -> Result<(), &'static str> {
+    managed_worktree_local_git_reclaim_gate(source, worktree, expected_sha)?;
+    managed_worktree_remote_exact_ref_gate(
+        source,
+        expected_sha,
+        "origin",
+        expected_origin_url,
+        remote_branch_ref,
+    )?;
+    // Revalidate immediately before the irreversible Git operation. Never
+    // use --force or prune: Git must reject a dirty or locked worktree itself.
+    managed_worktree_local_git_reclaim_gate(source, worktree, expected_sha)?;
+    let target = managed_worktree_git_cli_path(worktree);
+    let output = run_git_bounded(
+        source,
+        &["worktree", "remove", target.as_str()],
+        MANAGED_WORKTREE_GIT_TIMEOUT,
+        None,
+    )
+    .map_err(|_| "managed_reclaim_remove_indeterminate")?;
+    if !output.status.success() || output.stdout_capped || output.stderr_capped {
+        return Err("managed_reclaim_remove_indeterminate");
+    }
+    // A successful exit alone is not the durable post-removal receipt.
+    if std::fs::symlink_metadata(worktree).is_ok()
+        || source_mentions_worktree_path(source, worktree).unwrap_or(true)
+    {
+        return Err("managed_reclaim_remove_indeterminate");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod remote_recoverability_tests {
     use super::*;
@@ -559,6 +602,67 @@ mod remote_recoverability_tests {
             ),
             Ok(())
         );
+    }
+
+    #[test]
+    fn native_reclaim_normal_remove_protects_unique_data_and_removes_clean_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let bare = temp.path().join("bare.git");
+        let source = temp.path().join("source");
+        let child = temp.path().join("worktree");
+        std::fs::create_dir(&source).unwrap();
+        git(temp.path(), &["init", "--bare", bare.to_str().unwrap()]);
+        git(&source, &["init"]);
+        git(&source, &["config", "user.name", "Fixture"]);
+        git(
+            &source,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        std::fs::write(source.join("tracked.txt"), "recoverable").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "recoverable"]);
+        git(&source, &["branch", "-M", "main"]);
+        git(
+            &source,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+        );
+        git(&source, &["push", "origin", "main"]);
+        let sha = git(&source, &["rev-parse", "HEAD"]);
+        git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &managed_worktree_git_cli_path(&child),
+                "HEAD",
+            ],
+        );
+        std::fs::write(child.join("local-untracked.txt"), "keep forever").unwrap();
+        assert_eq!(
+            managed_worktree_normal_remove_after_gates(
+                &source,
+                &child,
+                &sha,
+                bare.to_str().unwrap(),
+                "refs/heads/main"
+            ),
+            Err("managed_reclaim_unique_content")
+        );
+        assert!(child.join("local-untracked.txt").exists());
+        std::fs::remove_file(child.join("local-untracked.txt")).unwrap();
+        assert_eq!(
+            managed_worktree_normal_remove_after_gates(
+                &source,
+                &child,
+                &sha,
+                bare.to_str().unwrap(),
+                "refs/heads/main"
+            ),
+            Ok(())
+        );
+        assert!(!child.exists());
+        assert!(!source_mentions_worktree_path(&source, &child).unwrap());
     }
 }
 
