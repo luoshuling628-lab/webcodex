@@ -293,7 +293,8 @@ mod durability_tests {
         );
         let source_project: RunnerProjectFile = serde_json::from_value(serde_json::json!({
             "id":"fixture-source", "path": source.to_string_lossy()
-        })).unwrap();
+        }))
+        .unwrap();
         let mut managed: RunnerProjectFile = serde_json::from_value(serde_json::json!({
             "id":"fixture-child","path":child.to_string_lossy(),
             "registration_source":"auto_registered", "managed_worktree":true,
@@ -303,17 +304,20 @@ mod durability_tests {
             "managed_source_project_id":"fixture-source",
             "managed_source_root_fingerprint":project_root_fingerprint(&source),
             "managed_base_sha":sha
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(
             super::managed_worktree::managed_worktree_reclaim_lineage_gate(
-                &managed, &source_project
+                &managed,
+                &source_project
             ),
             Ok(())
         );
         managed.managed_source_project_id = Some("foreign-source".to_owned());
         assert_eq!(
             super::managed_worktree::managed_worktree_reclaim_lineage_gate(
-                &managed, &source_project
+                &managed,
+                &source_project
             ),
             Err("managed_reclaim_source_project_mismatch")
         );
@@ -321,7 +325,8 @@ mod durability_tests {
         managed.managed_source_root_fingerprint = Some("wrong-fingerprint".to_owned());
         assert_eq!(
             super::managed_worktree::managed_worktree_reclaim_lineage_gate(
-                &managed, &source_project
+                &managed,
+                &source_project
             ),
             Err("managed_reclaim_source_fingerprint_mismatch")
         );
@@ -329,7 +334,8 @@ mod durability_tests {
         managed.registration_incarnation = Some("not-a-uuid".to_owned());
         assert_eq!(
             super::managed_worktree::managed_worktree_reclaim_lineage_gate(
-                &managed, &source_project
+                &managed,
+                &source_project
             ),
             Err("managed_reclaim_registration_identity_invalid")
         );
