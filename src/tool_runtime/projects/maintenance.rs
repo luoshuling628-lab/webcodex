@@ -221,9 +221,102 @@ impl ToolRuntime {
         if project.revision.as_deref() != Some(item.expected_revision.as_str()) {
             return ToolResult::err("revision_conflict");
         }
-        ToolResult::ok(
-            json!({"outcome":"previewed","path":project.path,"revision":project.revision,
-            "connected":client.view.connected,"changed":false,"execution_checks_pending":true}),
-        )
+        let mut output = json!({"outcome":"previewed","path":project.path,
+            "revision":project.revision,"connected":client.view.connected,
+            "changed":false,"execution_checks_pending":true});
+        if matches!(
+            project.lineage,
+            Some(crate::runner_protocol::RunnerProjectLineage::ManagedWorktreeSource { .. })
+        ) {
+            // A preview is NOT an execution lease or deletion authorization.
+            // Its Runner inventory can become stale immediately. Recheck all
+            // facts under the actual native Owner's durable execution fence.
+            let mut reason = native_cleanup_identity_blocker(project);
+            if reason.is_none() && !client.view.connected {
+                reason = Some("runner_disconnected");
+            }
+            if reason.is_none()
+                && !client.view.project_inventory.as_ref().is_some_and(|inventory| {
+                    inventory.sync_state == "complete"
+                })
+            {
+                reason = Some("runner_inventory_incomplete");
+            }
+            if reason.is_none() {
+                let jobs = self
+                    .runner_registry
+                    .count_active_jobs_for_project(access.as_ref(), &item.project)
+                    .await;
+                if jobs > 0 {
+                    reason = Some("runner_active_jobs");
+                }
+            }
+            if reason.is_none() {
+                reason = match self
+                    .sessions
+                    .begin_managed_worktree_cleanup_fence(&item.project)
+                {
+                    Ok(guard) => {
+                        // Dry-run only: never retain this short-lived guard as
+                        // evidence that cleanup is safe on a future turn.
+                        drop(guard);
+                        None
+                    }
+                    Err(_) => Some("session_closeout_not_proven"),
+                };
+            }
+            output["native_closeout_preflight"] = json!({
+                "status": "blocked",
+                "reason": reason.unwrap_or("process_lease_git_and_cas_execution_not_verified"),
+                "delete_authorized": false,
+                "source": "read_only_owner_snapshot",
+                "recheck_required_at_execution": true
+            });
+        }
+        ToolResult::ok(output)
+    }
+}
+
+fn native_cleanup_identity_blocker(project: &RunnerProjectSummary) -> Option<&'static str> {
+    if project.registration_source.as_deref() != Some("auto_registered")
+        || project.registration_incarnation.is_none()
+        || project.root_fingerprint.is_none()
+        || project.revision.is_none()
+    {
+        return Some("managed_worktree_identity_incomplete");
+    }
+    if project.git_dirty != Some(false) || project.git_head.is_none() {
+        return Some("managed_worktree_git_snapshot_not_clean");
+    }
+    None
+}
+
+#[cfg(test)]
+mod native_cleanup_preview_tests {
+    use super::*;
+
+    #[test]
+    fn native_identity_snapshot_never_proves_deletion_eligibility() {
+        let mut project: RunnerProjectSummary = serde_json::from_value(json!({
+            "id":"new-managed","path":"/disposable-new-worktree",
+            "updated_at": 1, "registration_source": "auto_registered",
+            "registration_incarnation":"11111111-1111-4111-8111-111111111111",
+            "root_fingerprint":"wc_projroot_example",
+            "revision": format!("sha256:{}", "a".repeat(64)),
+            "git_dirty": false,"git_head": "0123456789012345678901234567890123456789"
+        })).unwrap();
+        assert_eq!(native_cleanup_identity_blocker(&project), None);
+        project.registration_incarnation = None;
+        assert_eq!(
+            native_cleanup_identity_blocker(&project),
+            Some("managed_worktree_identity_incomplete")
+        );
+        project.registration_incarnation =
+            Some("11111111-1111-4111-8111-111111111111".to_string());
+        project.git_dirty = None;
+        assert_eq!(
+            native_cleanup_identity_blocker(&project),
+            Some("managed_worktree_git_snapshot_not_clean")
+        );
     }
 }
