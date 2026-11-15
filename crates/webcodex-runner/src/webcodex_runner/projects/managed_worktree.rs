@@ -389,6 +389,179 @@ pub(super) fn managed_worktree_local_git_reclaim_gate(
     Ok(())
 }
 
+/// Require a fresh, exact remote branch head before disposal. Local tracking
+/// branches and cached Git state are not evidence that a commit survived on
+/// the server. A symbolic HEAD or a tag is deliberately insufficient: the
+/// caller must supply an immutable source-bound branch ref.
+#[allow(dead_code)]
+pub(super) fn managed_worktree_remote_exact_ref_gate(
+    source: &Path,
+    expected_sha: &str,
+    remote: &str,
+    expected_origin_url: &str,
+    branch_ref: &str,
+) -> Result<(), &'static str> {
+    if !matches!(expected_sha.len(), 40 | 64)
+        || !expected_sha.bytes().all(|c| c.is_ascii_hexdigit())
+        || remote != "origin"
+        || expected_origin_url.is_empty()
+        || !branch_ref.starts_with("refs/heads/")
+        || branch_ref.len() <= "refs/heads/".len()
+        || branch_ref
+            .bytes()
+            .any(|c| !c.is_ascii_alphanumeric() && !matches!(c, b'/' | b'-' | b'_' | b'.'))
+        || branch_ref.contains("..")
+        || branch_ref.ends_with('/')
+        || branch_ref.ends_with(".lock")
+    {
+        return Err("managed_reclaim_remote_ref_unverified");
+    }
+    let configured_origin =
+        managed_worktree_git_text(source, &["config", "--get", "remote.origin.url"])?;
+    if configured_origin != expected_origin_url {
+        return Err("managed_reclaim_remote_origin_mismatch");
+    }
+    let output = run_git_bounded(
+        source,
+        &["ls-remote", "--exit-code", "--refs", "origin", branch_ref],
+        MANAGED_WORKTREE_GIT_TIMEOUT,
+        None,
+    )
+    .map_err(|_| "managed_reclaim_remote_unreachable")?;
+    if !output.status.success() || output.stdout_capped || output.stderr_capped {
+        return Err("managed_reclaim_remote_unreachable");
+    }
+    let stdout =
+        String::from_utf8(output.stdout).map_err(|_| "managed_reclaim_remote_ref_unverified")?;
+    let mut rows = stdout.lines();
+    let Some(row) = rows.next() else {
+        return Err("managed_reclaim_remote_ref_unverified");
+    };
+    if rows.next().is_some() {
+        return Err("managed_reclaim_remote_ref_unverified");
+    }
+    let Some((sha, name)) = row.split_once('\t') else {
+        return Err("managed_reclaim_remote_ref_unverified");
+    };
+    if name != branch_ref || !sha.eq_ignore_ascii_case(expected_sha) {
+        return Err("managed_reclaim_remote_commit_not_recoverable");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod remote_recoverability_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git executable");
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn native_reclaim_requires_exact_fresh_remote_branch_sha() {
+        let temp = tempfile::tempdir().unwrap();
+        let bare = temp.path().join("bare.git");
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        git(temp.path(), &["init", "--bare", bare.to_str().unwrap()]);
+        git(&source, &["init"]);
+        git(&source, &["config", "user.name", "Fixture"]);
+        git(
+            &source,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        std::fs::write(source.join("tracked.txt"), "v1").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "first"]);
+        git(&source, &["branch", "-M", "main"]);
+        git(
+            &source,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+        );
+        git(&source, &["push", "origin", "main"]);
+        let sha = git(&source, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            managed_worktree_remote_exact_ref_gate(
+                &source,
+                &sha,
+                "origin",
+                bare.to_str().unwrap(),
+                "refs/heads/main"
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            managed_worktree_remote_exact_ref_gate(
+                &source,
+                &sha,
+                "origin",
+                bare.to_str().unwrap(),
+                "HEAD"
+            ),
+            Err("managed_reclaim_remote_ref_unverified")
+        );
+        assert_eq!(
+            managed_worktree_remote_exact_ref_gate(
+                &source,
+                &sha,
+                "other",
+                bare.to_str().unwrap(),
+                "refs/heads/main"
+            ),
+            Err("managed_reclaim_remote_ref_unverified")
+        );
+
+        assert_eq!(
+            managed_worktree_remote_exact_ref_gate(
+                &source,
+                &sha,
+                "origin",
+                "https://github.com/other/repo.git",
+                "refs/heads/main"
+            ),
+            Err("managed_reclaim_remote_origin_mismatch")
+        );
+
+        std::fs::write(source.join("tracked.txt"), "v2").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "unpushed"]);
+        let unpushed = git(&source, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            managed_worktree_remote_exact_ref_gate(
+                &source,
+                &unpushed,
+                "origin",
+                bare.to_str().unwrap(),
+                "refs/heads/main"
+            ),
+            Err("managed_reclaim_remote_commit_not_recoverable")
+        );
+        git(&source, &["push", "origin", "main"]);
+        assert_eq!(
+            managed_worktree_remote_exact_ref_gate(
+                &source,
+                &unpushed,
+                "origin",
+                bare.to_str().unwrap(),
+                "refs/heads/main"
+            ),
+            Ok(())
+        );
+    }
+}
+
 fn managed_worktree_project_toml(
     id: &str,
     name: &str,
