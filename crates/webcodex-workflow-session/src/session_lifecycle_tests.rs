@@ -417,6 +417,63 @@ fn retained_project_session_counts_are_exact_and_cover_all_lifecycles() {
 }
 
 #[test]
+fn managed_worktree_cleanup_fence_blocks_active_session_and_racing_creation() {
+    let store = SessionStore::default();
+    let project = "agent:ruoshui:managed-new";
+    let active = store.start_session(
+        Some(project.to_string()),
+        Some("active worktree task".to_string()),
+    );
+    let foreign = store.start_session(
+        Some("agent:ruoshui:unrelated".to_string()),
+        Some("other active task".to_string()),
+    );
+
+    // Unlike ordinary unregister, auto-reclaim must not acquire a fence while
+    // the target still owns a live Session. A rejected attempt must not
+    // permanently block normal Session creation or closure.
+    assert_eq!(
+        store.begin_managed_worktree_cleanup_fence(project).unwrap_err(),
+        "managed_worktree_active_sessions"
+    );
+    assert_eq!(store.retained_project_session_counts(project), (1, 0));
+    let another = store.start_session(
+        Some(project.to_string()),
+        Some("not fenced after refusal".to_string()),
+    );
+    store.close_session(&active.session_id).unwrap();
+    assert!(store.begin_managed_worktree_cleanup_fence(project).is_err());
+    store.close_session(&another.session_id).unwrap();
+
+    let guard = store
+        .begin_managed_worktree_cleanup_fence(project)
+        .expect("all exact project sessions must be closed");
+    assert_eq!(store.retained_project_session_counts(project), (0, 2));
+    assert_eq!(store.retained_project_session_counts("agent:ruoshui:unrelated"), (1, 0));
+    assert!(store.begin_project_unregister_fence(project).is_err());
+    let racing = store.start_session_with_options(crate::SessionCreateOptions::new(
+        Some(project.to_string()),
+        Some("racing worktree session".to_string()),
+        SessionMode::Normal,
+        SessionGuards::default(),
+    ));
+    assert_eq!(racing.unwrap_err(), "project_retirement_in_progress");
+    drop(guard);
+
+    // A released cleanup fence must not affect independent active Sessions.
+    let resuming = store.start_session(
+        Some(project.to_string()),
+        Some("reopened after hold".to_string()),
+    );
+    assert_eq!(resuming.lifecycle, SessionLifecycle::Active);
+    assert_eq!(foreign.lifecycle, SessionLifecycle::Active);
+    // Ordinary unregister still deliberately supports historical close/read,
+    // including when a Session remains active.
+    let historical = store.begin_project_unregister_fence(project).unwrap();
+    drop(historical);
+}
+
+#[test]
 fn project_unregister_fence_blocks_racing_session_creation_and_preserves_history() {
     let store = SessionStore::default();
     let project = "agent:ruoshui:retiring";
