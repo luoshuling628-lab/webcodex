@@ -1137,7 +1137,7 @@ mod tests {
     #[test]
     fn native_managed_closeout_requires_exact_registered_clean_identity() {
         let mut project: RunnerProjectSummary = serde_json::from_value(json!({
-            "id":"new-child", "path":"/disposable-child",
+            "id":"new-child", "path":"/disposable-child", "updated_at":1,
             "registration_source":"auto_registered",
             "registration_incarnation":"11111111-1111-4111-8111-111111111111",
             "root_fingerprint":"wc_projroot_test",
@@ -1150,11 +1150,13 @@ mod tests {
                 "source_root_fingerprint":"wc_projroot_source",
                 "base_sha":"0123456789012345678901234567890123456789"
             }
-        })).unwrap();
+        }))
+        .unwrap();
         let expected = format!("sha256:{}", "a".repeat(64));
         assert!(native_closeout_owner_identity_ready(&project, &expected));
         assert!(!native_closeout_owner_identity_ready(
-            &project, &format!("sha256:{}", "b".repeat(64))
+            &project,
+            &format!("sha256:{}", "b".repeat(64))
         ));
         project.git_dirty = None;
         assert!(!native_closeout_owner_identity_ready(&project, &expected));
