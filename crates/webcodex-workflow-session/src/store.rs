@@ -1006,8 +1006,7 @@ impl SessionStore {
         }
         if require_all_closed
             && inner.sessions.values().any(|record| {
-                record.project() == Some(project)
-                    && record.lifecycle() == SessionLifecycle::Active
+                record.project() == Some(project) && record.lifecycle() == SessionLifecycle::Active
             })
         {
             return Err("managed_worktree_active_sessions".to_string());
