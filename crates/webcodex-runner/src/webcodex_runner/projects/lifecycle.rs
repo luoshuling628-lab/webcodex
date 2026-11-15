@@ -24,7 +24,7 @@ use super::{
 use crate::webcodex_runner::output::{err_cmd, ok_cmd, CommandResult};
 
 #[derive(Debug)]
-enum ProjectUnregisterError {
+pub(super) enum ProjectUnregisterError {
     BeforeRename,
     AfterRename,
 }
@@ -94,7 +94,7 @@ fn cleanup_unregister_tombstones(project_registry_dir: &Path, id: &str) -> Resul
     Ok(())
 }
 
-fn unregister_project_config(path: &Path) -> Result<(), ProjectUnregisterError> {
+pub(super) fn unregister_project_config(path: &Path) -> Result<(), ProjectUnregisterError> {
     let dir = path.parent().ok_or(ProjectUnregisterError::BeforeRename)?;
     let id = path
         .file_stem()

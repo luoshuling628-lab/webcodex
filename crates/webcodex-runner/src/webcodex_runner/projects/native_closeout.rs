@@ -28,6 +28,8 @@ pub(super) struct NativeCloseoutRecord {
     pub expected_root_fingerprint: String,
     pub expected_origin_url: String,
     pub expected_remote_ref: String,
+    pub source_root: String,
+    pub worktree_root: String,
     pub phase: CloseoutPhase,
 }
 
@@ -42,6 +44,8 @@ fn validate_record(record: &NativeCloseoutRecord) -> Result<(), &'static str> {
         || record.expected_revision.is_empty()
         || record.expected_root_fingerprint.is_empty()
         || record.expected_origin_url.is_empty()
+        || record.source_root.is_empty()
+        || record.worktree_root.is_empty()
         || !record.expected_remote_ref.starts_with("refs/heads/")
         || !matches!(record.expected_head.len(), 40 | 64)
         || !record.expected_head.bytes().all(|c| c.is_ascii_hexdigit())
@@ -144,6 +148,137 @@ pub(super) fn advance(
     Ok(updated)
 }
 
+/// Runner-side effect transaction. This is intentionally not a dispatchable
+/// Runner operation: the Server must first bind a continuously held, exact
+/// Session + Job fence and prove terminal processes/leases. The existing
+/// unguarded admin admission endpoint MUST NOT call this function.
+#[allow(dead_code)]
+pub(super) fn execute_under_verified_owner(
+    policy: &super::super::config::RunnerPolicy,
+    registry: &Path,
+    candidate: NativeCloseoutRecord,
+) -> Result<NativeCloseoutRecord, &'static str> {
+    use webcodex_runner_config::paths::paths_equal;
+
+    // Hold the existing Runner registry CAS lock across all effects and
+    // journal transitions. No independent unregister is allowed to interleave.
+    let _lock = super::project_registry_write_lock()
+        .lock()
+        .map_err(|_| "native_closeout_registry_lock_failed")?;
+    validate_record(&candidate)?;
+    if candidate.phase != CloseoutPhase::Prepared {
+        return Err("native_closeout_invalid_phase");
+    }
+    super::registration::validate_project_op_id(&candidate.project_id)
+        .map_err(|_| "native_closeout_invalid_identity")?;
+    let registry = super::super::shell::canonicalize_existing(registry)
+        .map_err(|_| "native_closeout_registry_missing")?;
+    let config = registry.join(format!("{}.toml", candidate.project_id));
+    let source = super::super::shell::canonicalize_existing(Path::new(&candidate.source_root))
+        .map_err(|_| "native_closeout_source_missing")?;
+    if !paths_equal(&source, Path::new(&candidate.source_root))
+        || super::registration::validate_project_path_policy(policy, &source).is_err()
+    {
+        return Err("native_closeout_source_identity_conflict");
+    }
+    let target = Path::new(&candidate.worktree_root);
+    let intent_preexists = ledger_path(&registry, &candidate).exists();
+    // A fresh intent must be anchored in the current Runner registration.
+    // A crash retry can use the immutable journal only after the prior
+    // prepared identity was durably recorded.
+    if !intent_preexists && !config.exists() {
+        return Err("native_closeout_registration_missing");
+    }
+    if !intent_preexists && !target.exists() {
+        return Err("native_closeout_target_missing");
+    }
+
+    if config.exists() {
+        let content =
+            fs::read_to_string(&config).map_err(|_| "native_closeout_registration_unavailable")?;
+        let child = super::catalog::parse_runner_project_toml(&content)
+            .map_err(|_| "native_closeout_registration_unavailable")?;
+        if child.id != candidate.project_id
+            || super::catalog::project_revision(&child) != candidate.expected_revision
+            || child.registration_incarnation.as_deref()
+                != Some(candidate.expected_incarnation.as_str())
+            || child.path != candidate.worktree_root
+        {
+            return Err("native_closeout_registration_cas_conflict");
+        }
+        // The identity gate must be rechecked while the real Worktree exists.
+        if target.exists() {
+            let projects = super::registration::load_project_files_for_path_resolution(&registry)
+                .map_err(|_| "native_closeout_registration_unavailable")?;
+            let source_project = projects
+                .iter()
+                .find(|p| p.id == child.managed_source_project_id.clone().unwrap_or_default())
+                .ok_or("native_closeout_source_unregistered")?;
+            super::managed_worktree::managed_worktree_reclaim_lineage_gate(&child, source_project)?;
+            let canonical_target = super::super::shell::canonicalize_existing(target)
+                .map_err(|_| "native_closeout_target_missing")?;
+            if !paths_equal(&canonical_target, target)
+                || super::registration::validate_project_path_policy(policy, &canonical_target)
+                    .is_err()
+                || super::catalog::project_root_fingerprint(&canonical_target)
+                    != candidate.expected_root_fingerprint
+                || child.managed_base_sha.as_deref() != Some(candidate.expected_head.as_str())
+            {
+                return Err("native_closeout_worktree_identity_conflict");
+            }
+        }
+    }
+
+    let mut current = begin_or_read(&registry, candidate.clone())?;
+    if current.phase == CloseoutPhase::Prepared {
+        if target.exists() {
+            if !config.exists() {
+                return Err("native_closeout_registration_missing");
+            }
+            super::managed_worktree::managed_worktree_normal_remove_after_gates(
+                &source,
+                target,
+                &current.expected_head,
+                &current.expected_origin_url,
+                &current.expected_remote_ref,
+            )?;
+        } else if !intent_preexists {
+            return Err("native_closeout_target_missing");
+        }
+        // In a post-delete crash, the persisted PREPARED journal plus a
+        // missing folder and missing Git link are required for reconciliation.
+        // Never invoke git worktree prune or force-remove as a recovery shortcut.
+        if fs::symlink_metadata(target).is_ok()
+            || super::managed_worktree::source_mentions_worktree_path(&source, target)
+                .unwrap_or(true)
+        {
+            return Err("native_closeout_git_state_indeterminate");
+        }
+        current = advance(&registry, &current, CloseoutPhase::GitRemoved)?;
+    }
+    if current.phase == CloseoutPhase::GitRemoved {
+        if fs::symlink_metadata(target).is_ok()
+            || super::managed_worktree::source_mentions_worktree_path(&source, target)
+                .unwrap_or(true)
+        {
+            return Err("native_closeout_git_state_indeterminate");
+        }
+        if config.exists() {
+            // Exact CAS was checked above, under the same registry lock.
+            super::lifecycle::unregister_project_config(&config)
+                .map_err(|_| "native_closeout_unregister_indeterminate")?;
+        }
+        if config.exists() {
+            return Err("native_closeout_unregister_indeterminate");
+        }
+        current = advance(&registry, &current, CloseoutPhase::Unregistered)?;
+    }
+    if config.exists() || fs::symlink_metadata(target).is_ok() {
+        return Err("native_closeout_terminal_state_conflict");
+    }
+    Ok(current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,8 +293,127 @@ mod tests {
             expected_root_fingerprint: "root".into(),
             expected_origin_url: "https://github.com/example/repo.git".into(),
             expected_remote_ref: "refs/heads/main".into(),
+            source_root: "C:/fixture/source".into(),
+            worktree_root: "C:/fixture/worktree".into(),
             phase: CloseoutPhase::Prepared,
         }
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "{:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn native_closeout_full_runner_transaction_is_durable_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let child = temp.path().join("child-worktree");
+        let remote = temp.path().join("remote.git");
+        let registry = temp.path().join("registry");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&registry).unwrap();
+        git(temp.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        git(&source, &["init"]);
+        git(&source, &["config", "user.name", "Fixture"]);
+        git(
+            &source,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        fs::write(source.join("data.txt"), "recoverable").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "fixture"]);
+        git(&source, &["branch", "-M", "main"]);
+        git(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&source, &["push", "origin", "main"]);
+        let sha = git(&source, &["rev-parse", "HEAD"]);
+        git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &super::super::managed_worktree::managed_worktree_git_cli_path(&child),
+                "HEAD",
+            ],
+        );
+        let source = super::super::super::shell::canonicalize_existing(&source).unwrap();
+        let child = super::super::super::shell::canonicalize_existing(&child).unwrap();
+        let source_text = source.to_str().unwrap();
+        let child_text = child.to_str().unwrap();
+        let source_content = super::super::registration::build_project_toml(
+            "fixture-source",
+            "Source",
+            source_text,
+            &None,
+            true,
+        );
+        fs::write(registry.join("fixture-source.toml"), source_content).unwrap();
+        let managed = super::super::managed_worktree::managed_worktree_project_toml(
+            "fixture-child",
+            "Managed",
+            child_text,
+            source_text,
+            "fixture-source",
+            &super::super::catalog::project_root_fingerprint(&source),
+            "main",
+            &sha,
+            &uuid::Uuid::new_v4().to_string(),
+        );
+        fs::write(registry.join("fixture-child.toml"), &managed).unwrap();
+        let parsed = super::super::catalog::parse_runner_project_toml(&managed).unwrap();
+        let candidate = NativeCloseoutRecord {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            project_id: "fixture-child".into(),
+            expected_revision: super::super::catalog::project_revision(&parsed),
+            expected_incarnation: parsed.registration_incarnation.clone().unwrap(),
+            expected_head: sha,
+            expected_root_fingerprint: super::super::catalog::project_root_fingerprint(&child),
+            expected_origin_url: remote.to_str().unwrap().into(),
+            expected_remote_ref: "refs/heads/main".into(),
+            source_root: source_text.into(),
+            worktree_root: child_text.into(),
+            phase: CloseoutPhase::Prepared,
+        };
+        let policy = super::super::super::config::RunnerPolicy {
+            allowed_roots: vec![temp.path().to_path_buf()],
+            ..Default::default()
+        };
+
+        fs::write(child.join("unique.txt"), "do not delete").unwrap();
+        assert_eq!(
+            execute_under_verified_owner(&policy, &registry, candidate.clone()).unwrap_err(),
+            "managed_reclaim_unique_content"
+        );
+        assert!(child.join("unique.txt").exists());
+        fs::remove_file(child.join("unique.txt")).unwrap();
+        let done = execute_under_verified_owner(&policy, &registry, candidate.clone()).unwrap();
+        assert_eq!(done.phase, CloseoutPhase::Unregistered);
+        assert!(!child.exists());
+        assert!(!registry.join("fixture-child.toml").exists());
+        assert_eq!(
+            execute_under_verified_owner(&policy, &registry, candidate.clone()).unwrap(),
+            done
+        );
+        let mut conflict = candidate;
+        conflict.expected_head = "b".repeat(40);
+        assert_eq!(
+            execute_under_verified_owner(&policy, &registry, conflict).unwrap_err(),
+            "native_closeout_idempotency_conflict"
+        );
     }
 
     #[test]

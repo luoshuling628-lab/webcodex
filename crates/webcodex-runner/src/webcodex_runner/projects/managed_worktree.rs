@@ -257,7 +257,10 @@ pub(super) fn managed_worktree_git_cli_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn source_mentions_worktree_path(source: &Path, worktree: &Path) -> Result<bool, &'static str> {
+pub(super) fn source_mentions_worktree_path(
+    source: &Path,
+    worktree: &Path,
+) -> Result<bool, &'static str> {
     let listing = managed_worktree_git_text(source, &["worktree", "list", "--porcelain"])?;
     Ok(listing
         .lines()
@@ -666,7 +669,7 @@ mod remote_recoverability_tests {
     }
 }
 
-fn managed_worktree_project_toml(
+pub(super) fn managed_worktree_project_toml(
     id: &str,
     name: &str,
     worktree: &str,
