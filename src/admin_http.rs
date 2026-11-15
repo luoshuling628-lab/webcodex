@@ -753,6 +753,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn native_closeout_admission_route_is_admin_only_and_never_grants_delete() {
+        async fn admission(auth: Option<AuthContext>, origin: &str, body: &str) -> (StatusCode, Value) {
+            let mut response = TestClient::post("http://127.0.0.1/admin/projects/native-closeout-admission")
+                .add_header("host", "127.0.0.1", true)
+                .add_header("content-type", "application/json", true)
+                .add_header("origin", origin, true)
+                .body(body.to_string())
+                .send(&service(auth))
+                .await;
+            (response.status_code.unwrap(), response.take_json::<Value>().await.unwrap())
+        }
+        let valid = json!({
+            "project":"agent:managed-runner:disposable",
+            "expected_revision": format!("sha256:{}", "a".repeat(64))
+        }).to_string();
+        assert_eq!(admission(None, "http://127.0.0.1", &valid).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            admission(Some(AuthContext::new(AuthKind::AgentToken)), "http://127.0.0.1", &valid)
+                .await.0,
+            StatusCode::FORBIDDEN
+        );
+        let mut admin = AuthContext::new(AuthKind::ApiToken);
+        admin.scopes.push(SCOPE_ADMIN.to_string());
+        assert_eq!(admission(Some(admin.clone()), "http://evil.invalid", &valid).await.0, StatusCode::FORBIDDEN);
+        let bad = json!({
+            "project":"agent:managed-runner:disposable",
+            "expected_revision": format!("sha256:{}", "a".repeat(64)),
+            "delete_authorized":true
+        }).to_string();
+        assert_eq!(admission(Some(admin.clone()), "http://127.0.0.1", &bad).await.0, StatusCode::BAD_REQUEST);
+        let (status, body) = admission(Some(admin), "http://127.0.0.1", &valid).await;
+        // No connected Runner or exact Project in this isolated server.
+        assert_ne!(status, StatusCode::OK);
+        assert_ne!(body.get("delete_authorized").and_then(Value::as_bool), Some(true));
+    }
+
     #[test]
     fn dashboard_projection_exposes_lifecycle_actions() {
         let body = populated_projection(true);
