@@ -57,6 +57,15 @@ pub(crate) struct CreateProjectRequest {
     pub idempotency_key: String,
 }
 
+/// Read-only admission request. Its result can NEVER be used as a
+/// filesystem removal permit: the protective guards are released on return.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeCloseoutAdmissionRequest {
+    pub project: String,
+    pub expected_revision: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProjectMutationRequest {
@@ -230,6 +239,49 @@ pub(crate) struct AdminProjectLifecycleService {
 impl AdminProjectLifecycleService {
     pub(crate) fn new(runtime: Arc<ToolRuntime>, db: Arc<Database>) -> Self {
         Self { runtime, db }
+    }
+
+    /// Make the existing Native Owner fences reachable through the protected
+    /// admin control plane without granting any delete capability. The actual
+    /// executor needs its own continuous guard lifetime, live Runner evidence,
+    /// GitHub recoverability proof, and persistent transaction receipts.
+    pub(crate) async fn native_closeout_admission(
+        &self,
+        auth: &AuthContext,
+        request: NativeCloseoutAdmissionRequest,
+    ) -> ServiceResponse {
+        match begin_native_managed_closeout_fences(
+            self.runtime.as_ref(),
+            auth,
+            &request.project,
+            &request.expected_revision,
+        )
+        .await
+        {
+            Ok(guard) => {
+                drop(guard);
+                ServiceResponse {
+                    status: 200,
+                    body: json!({
+                        "outcome": "native_closeout_admission_observed",
+                        "project": request.project,
+                        "expected_revision": request.expected_revision,
+                        "status": "blocked",
+                        "delete_authorized": false,
+                        "admission_fence_released": true,
+                        "execution_lease_held": false,
+                        "remaining": [
+                            "runner_process_and_job_terminal_receipt",
+                            "remote_git_recoverability",
+                            "one_transaction_cas_unregister_and_normal_remove",
+                            "durable_post_removal_receipt",
+                            "independent_release_admission"
+                        ]
+                    }),
+                }
+            }
+            Err(error) => error,
+        }
     }
 
     pub(crate) async fn register(
