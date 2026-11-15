@@ -977,9 +977,40 @@ impl SessionStore {
         &self,
         project: &str,
     ) -> Result<SessionProjectUnregisterGuard, String> {
+        self.begin_project_retirement_fence(project, false)
+    }
+
+    /// Dedicated Session-side gate for *automatic managed-worktree cleanup*.
+    ///
+    /// Unlike ordinary unregister (which must preserve historical close/read
+    /// workflows), physical reclamation cannot start while any Session of the
+    /// exact Project is active. The check and reservation share the same lock,
+    /// preventing a new Session from racing the decision. This gate is NOT a
+    /// deletion permit: Runner jobs/leases, exact Project incarnation, Git
+    /// recoverability, and durable Owner receipts require separate proof.
+    pub fn begin_managed_worktree_cleanup_fence(
+        &self,
+        project: &str,
+    ) -> Result<SessionProjectUnregisterGuard, String> {
+        self.begin_project_retirement_fence(project, true)
+    }
+
+    fn begin_project_retirement_fence(
+        &self,
+        project: &str,
+        require_all_closed: bool,
+    ) -> Result<SessionProjectUnregisterGuard, String> {
         let mut inner = self.inner.lock().expect("session store mutex poisoned");
         if inner.unregistering_projects.contains(project) {
             return Err("project_retirement_already_in_progress".to_string());
+        }
+        if require_all_closed
+            && inner.sessions.values().any(|record| {
+                record.project() == Some(project)
+                    && record.lifecycle() == SessionLifecycle::Active
+            })
+        {
+            return Err("managed_worktree_active_sessions".to_string());
         }
         inner.unregistering_projects.insert(project.to_string());
         Ok(SessionProjectUnregisterGuard {
