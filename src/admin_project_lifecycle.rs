@@ -147,6 +147,34 @@ impl NativeManagedCloseoutFences {
     }
 }
 
+/// Validate the exact terminal Runner payload at the trusted transport
+/// boundary. This parser alone does NOT authenticate its provenance: only a
+/// matched RunnerRegistry request/response from the fenced live instance may
+/// call it. Never accept user-supplied JSON as a terminal receipt.
+#[allow(dead_code)]
+fn native_closeout_terminal_receipt_matches(
+    exit_code: Option<i32>,
+    output: &Value,
+    project_id: &str,
+    operation_id: &str,
+    revision: &str,
+    incarnation: &str,
+) -> bool {
+    exit_code == Some(0)
+        && output.get("error_code").is_none()
+        && output.get("operation").and_then(Value::as_str) == Some("native_managed_closeout")
+        && output.get("outcome").and_then(Value::as_str) == Some("native_closeout_completed")
+        && output.get("changed").and_then(Value::as_bool) == Some(true)
+        && output.get("phase").and_then(Value::as_str) == Some("unregistered")
+        && output.get("agent_project_id").and_then(Value::as_str) == Some(project_id)
+        && output.get("operation_id").and_then(Value::as_str) == Some(operation_id)
+        && output.get("expected_revision").and_then(Value::as_str) == Some(revision)
+        && output
+            .get("registration_incarnation")
+            .and_then(Value::as_str)
+            == Some(incarnation)
+}
+
 fn native_closeout_owner_identity_ready(
     project: &RunnerProjectSummary,
     expected_revision: &str,
@@ -1478,6 +1506,53 @@ mod tests {
             lifecycle_summary(&malformed, "demo").is_none(),
             "invalid registration identity must fail closed before a Registry update"
         );
+    }
+
+    #[test]
+    fn native_closeout_terminal_receipt_requires_all_exact_identity_fields() {
+        let source = json!({
+            "operation": "native_managed_closeout",
+            "outcome": "native_closeout_completed",
+            "changed": true,
+            "phase": "unregistered",
+            "agent_project_id": "child-1",
+            "operation_id": "op-1",
+            "expected_revision": "sha256:expected",
+            "registration_incarnation": "incarnation-1"
+        });
+        let check = |exit_code, body: &Value| {
+            native_closeout_terminal_receipt_matches(
+                exit_code,
+                body,
+                "child-1",
+                "op-1",
+                "sha256:expected",
+                "incarnation-1",
+            )
+        };
+        assert!(check(Some(0), &source));
+        assert!(!check(Some(1), &source));
+        assert!(!check(None, &source));
+        for (field, replacement) in [
+            ("operation", json!("project_lifecycle_unregister")),
+            ("outcome", json!("native_closeout_admission_observed")),
+            ("changed", json!(false)),
+            ("phase", json!("git_removed")),
+            ("agent_project_id", json!("child-2")),
+            ("operation_id", json!("op-old")),
+            ("expected_revision", json!("sha256:other")),
+            ("registration_incarnation", json!("incarnation-old")),
+        ] {
+            let mut changed = source.clone();
+            changed[field] = replacement;
+            assert!(!check(Some(0), &changed), "must reject {field}");
+            let mut missing = source.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(!check(Some(0), &missing), "must require {field}");
+        }
+        let mut contradictory = source;
+        contradictory["error_code"] = json!("operation_indeterminate");
+        assert!(!check(Some(0), &contradictory));
     }
 
     #[test]
