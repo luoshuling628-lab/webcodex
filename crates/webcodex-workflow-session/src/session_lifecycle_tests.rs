@@ -53,6 +53,67 @@ fn session_tool_contract(tool_name: &str) -> SessionToolContract {
 }
 
 #[test]
+fn native_closeout_terminal_release_requires_exact_durable_cas_and_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("reconcile.json");
+    let project = "agent:runner:managed-child";
+    let first = persistent_store(ledger.clone());
+    let closed = first.start_session_with_guards(
+        Some(project.to_string()),
+        Some("finished".to_string()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    first.close_session(&closed.session_id).unwrap();
+    first.flush_persistence();
+    let fence = first.begin_managed_worktree_cleanup_fence(project).unwrap();
+    fence.persist_managed_closeout("op-123").unwrap();
+    drop(fence);
+    drop(first);
+
+    let resumed = persistent_store(ledger.clone());
+    assert_eq!(
+        resumed
+            .reconcile_durable_managed_closeout_terminal(project, "op-stale")
+            .unwrap_err(),
+        "durable_closeout_operation_conflict"
+    );
+    assert_eq!(
+        resumed.durable_managed_worktree_closeout(project),
+        Some("op-123".into())
+    );
+    assert!(resumed
+        .start_session_with_options(crate::SessionCreateOptions::new(
+            Some(project.into()),
+            Some("must stay blocked".into()),
+            SessionMode::ReadOnly,
+            SessionGuards::default()
+        ))
+        .is_err());
+
+    resumed
+        .reconcile_durable_managed_closeout_terminal(project, "op-123")
+        .unwrap();
+    assert_eq!(resumed.durable_managed_worktree_closeout(project), None);
+    assert_eq!(
+        resumed
+            .reconcile_durable_managed_closeout_terminal(project, "op-123")
+            .unwrap_err(),
+        "durable_closeout_not_reserved"
+    );
+    drop(resumed);
+    let reopened = persistent_store(ledger);
+    assert_eq!(reopened.durable_managed_worktree_closeout(project), None);
+    let next = reopened.start_session_with_guards(
+        Some(project.into()),
+        Some("permitted after trusted reconciliation".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    assert_eq!(next.project.as_deref(), Some(project));
+}
+
+#[test]
 fn native_closeout_held_session_guard_upgrades_durably_without_admission_gap() {
     let temp = tempfile::tempdir().unwrap();
     let ledger = temp.path().join("upgrade.json");

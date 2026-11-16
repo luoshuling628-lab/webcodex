@@ -1116,6 +1116,39 @@ impl SessionStore {
         inner.durable_closeout_projects.get(project).cloned()
     }
 
+    /// Exact terminal closeout reconciliation, internal to this Session
+    /// domain. The trusted Server Native Owner must validate the Runner
+    /// registration-incarnation, job completion and durable Git-removed
+    /// receipt BEFORE calling this function. A response body or a timeout is
+    /// never itself proof. This primitive is not a public release API.
+    #[allow(dead_code)]
+    pub(crate) fn reconcile_durable_managed_closeout_terminal(
+        &self,
+        project: &str,
+        operation_id: &str,
+    ) -> Result<(), String> {
+        let mut inner = self.inner.lock().map_err(|_| "session_store_unavailable")?;
+        let Some(saved) = inner.durable_closeout_projects.get(project) else {
+            return Err("durable_closeout_not_reserved".to_string());
+        };
+        if saved != operation_id {
+            return Err("durable_closeout_operation_conflict".to_string());
+        }
+        // No Session may be created until the SQLite release commit is
+        // confirmed, under the same Session admission mutex.
+        let db = inner
+            .persistence
+            .as_ref()
+            .ok_or_else(|| "durable_closeout_requires_database".to_string())?
+            .database
+            .clone();
+        db.release_managed_closeout(project, operation_id)
+            .map_err(|_| "durable_closeout_terminal_release_uncertain".to_string())?;
+        inner.durable_closeout_projects.remove(project);
+        inner.unregistering_projects.remove(project);
+        Ok(())
+    }
+
     /// Dedicated Session-side gate for *automatic managed-worktree cleanup*.
     ///
     /// Unlike ordinary unregister (which must preserve historical close/read
