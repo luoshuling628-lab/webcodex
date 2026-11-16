@@ -337,6 +337,73 @@ async fn native_closeout_dispatch_pins_exact_runner_instance_and_capability() {
     );
 }
 
+#[tokio::test]
+async fn native_closeout_projection_cas_rejects_new_incarnation_and_is_idempotent() {
+    let registry = RunnerRegistry::default();
+    register_with_instance(&registry, "runner-cas", "instance-1").await;
+    let mut project = project_summary("managed-child", "/tmp/managed-child");
+    project.registration_incarnation = Some("11111111-1111-4111-8111-111111111111".to_string());
+    registry
+        .upsert_runner_project("runner-cas", project)
+        .await
+        .unwrap();
+    assert_eq!(
+        registry
+            .reconcile_native_closeout_project_for_instance(
+                "runner-cas",
+                "instance-1",
+                "managed-child",
+                "22222222-2222-4222-8222-222222222222"
+            )
+            .await
+            .unwrap_err(),
+        "native_closeout_projection_cas_conflict"
+    );
+    assert!(registry
+        .get_runner_view("runner-cas")
+        .await
+        .unwrap()
+        .projects
+        .iter()
+        .any(|p| p.id == "managed-child"));
+    assert_eq!(
+        registry
+            .reconcile_native_closeout_project_for_instance(
+                "runner-cas",
+                "instance-1",
+                "managed-child",
+                "11111111-1111-4111-8111-111111111111"
+            )
+            .await
+            .unwrap(),
+        true
+    );
+    assert_eq!(
+        registry
+            .reconcile_native_closeout_project_for_instance(
+                "runner-cas",
+                "instance-1",
+                "managed-child",
+                "11111111-1111-4111-8111-111111111111"
+            )
+            .await
+            .unwrap(),
+        false
+    );
+    assert_eq!(
+        registry
+            .reconcile_native_closeout_project_for_instance(
+                "runner-cas",
+                "replaced-instance",
+                "managed-child",
+                "11111111-1111-4111-8111-111111111111"
+            )
+            .await
+            .unwrap_err(),
+        "native_closeout_runner_instance_conflict"
+    );
+}
+
 #[test]
 fn runner_owner_access_projection_enforces_owner_boundary() {
     use crate::access_control::assert_runner_owner;

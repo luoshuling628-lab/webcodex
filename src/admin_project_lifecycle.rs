@@ -256,6 +256,34 @@ fn native_closeout_bound_runner_payload(
     }))
 }
 
+/// Read-only recovered terminal must not masquerade as a fresh mutation
+/// receipt. Identity matching is necessary but the trusted exact-instance
+/// Registry response is also required before releasing a durable lease.
+#[allow(dead_code)]
+fn native_closeout_readonly_terminal_receipt_matches(
+    exit_code: Option<i32>,
+    output: &Value,
+    project_id: &str,
+    operation_id: &str,
+    revision: &str,
+    incarnation: &str,
+) -> bool {
+    exit_code == Some(0)
+        && output.get("error_code").is_none()
+        && output.get("operation").and_then(Value::as_str)
+            == Some("native_managed_closeout_receipt")
+        && output.get("outcome").and_then(Value::as_str) == Some("native_closeout_completed")
+        && output.get("changed").and_then(Value::as_bool) == Some(false)
+        && output.get("phase").and_then(Value::as_str) == Some("unregistered")
+        && output.get("agent_project_id").and_then(Value::as_str) == Some(project_id)
+        && output.get("operation_id").and_then(Value::as_str) == Some(operation_id)
+        && output.get("expected_revision").and_then(Value::as_str) == Some(revision)
+        && output
+            .get("registration_incarnation")
+            .and_then(Value::as_str)
+            == Some(incarnation)
+}
+
 fn native_closeout_owner_identity_ready(
     project: &RunnerProjectSummary,
     expected_revision: &str,
@@ -514,7 +542,12 @@ impl AdminProjectLifecycleService {
         // Keep the durable Session block on any CAS or SQLite ambiguity.
         self.runtime
             .runner_registry
-            .remove_runner_project_for_instance(&client_id, &instance_id, &project_id)
+            .reconcile_native_closeout_project_for_instance(
+                &client_id,
+                &instance_id,
+                &project_id,
+                &incarnation,
+            )
             .await
             .map_err(|_| api_error(503, "native_closeout_projection_indeterminate"))?;
         self.runtime
@@ -529,6 +562,176 @@ impl AdminProjectLifecycleService {
                 "project": intent.project,
                 "operation_id": intent.operation_id,
                 "status": "completed",
+            }),
+        })
+    }
+
+    /// Server-crash recovery for an operation whose Runner has already
+    /// committed unregistration. Rehydrate the immutable request from SQLite,
+    /// not from a potentially missing live Project inventory. Only a trusted
+    /// exact-Runner-instance read-only terminal receipt can release this lease.
+    /// Kept internal until an independently admitted recovery trigger exists.
+    #[allow(dead_code)]
+    async fn reconcile_native_closeout_after_restart(
+        &self,
+        auth: &AuthContext,
+        project: &str,
+        operation_id: &str,
+    ) -> Result<ServiceResponse, ServiceResponse> {
+        if !admin_project_mutation_authorized(auth) {
+            return Err(api_error(403, "admin_authority_required"));
+        }
+        let (client_id, project_id) = parse_runtime_project(project)?;
+        if uuid::Uuid::parse_str(operation_id).is_err() {
+            return Err(api_error(409, "native_closeout_recovery_identity_invalid"));
+        }
+        let binding_json = self
+            .runtime
+            .sessions
+            .durable_managed_worktree_binding(project, operation_id)
+            .map_err(|_| api_error(409, "native_closeout_binding_unavailable"))?
+            .ok_or_else(|| api_error(409, "native_closeout_binding_missing"))?;
+        let binding: Value = serde_json::from_str(&binding_json)
+            .map_err(|_| api_error(409, "native_closeout_binding_unverified"))?;
+        let field = |key| binding.get(key).and_then(Value::as_str);
+        if field("operation_id") != Some(operation_id)
+            || field("project_id") != Some(project_id.as_str())
+            || field("phase") != Some("prepared")
+            || field("expected_head").is_none()
+            || field("expected_remote_ref").is_none()
+            || field("source_root").is_none()
+            || field("worktree_root").is_none()
+            || field("expected_origin_url").is_none()
+        {
+            return Err(api_error(409, "native_closeout_binding_unverified"));
+        }
+        let revision = field("expected_revision")
+            .ok_or_else(|| api_error(409, "native_closeout_binding_unverified"))?
+            .to_string();
+        validate_revision(&revision)?;
+        let incarnation = field("expected_incarnation")
+            .ok_or_else(|| api_error(409, "native_closeout_binding_unverified"))?
+            .to_string();
+        if uuid::Uuid::parse_str(&incarnation).is_err() {
+            return Err(api_error(409, "native_closeout_binding_unverified"));
+        }
+        let access = crate::runner_http::runner_access_from_auth(Some(auth));
+        self.runtime
+            .runner_registry
+            .assert_runner_access(access.as_ref(), &client_id)
+            .await
+            .map_err(|_| api_error(403, "runner_access_denied"))?;
+        let runner = self
+            .runtime
+            .runner_registry
+            .get_runner_semantic_view_for_auth(&client_id, access.as_ref())
+            .await
+            .ok_or_else(|| api_error(503, "agent_unavailable"))?;
+        if !runner.view.connected
+            || runner.view.status != "online"
+            || !runner.supports(RunnerFeature::NativeManagedCloseout)
+            || !runner
+                .view
+                .project_inventory
+                .as_ref()
+                .is_some_and(|inventory| inventory.sync_state == "complete")
+        {
+            return Err(api_error(503, "native_closeout_runner_not_admitted"));
+        }
+        // A new Project with the same ID must never be removed by an old
+        // receipt. A missing Project is allowed here ONLY because the Runner
+        // read-only transaction proof will independently establish its removal.
+        if runner
+            .view
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .is_some_and(|p| p.registration_incarnation.as_deref() != Some(incarnation.as_str()))
+        {
+            return Err(api_error(409, "native_closeout_projection_cas_conflict"));
+        }
+        let instance_id = runner.view.runner_instance_id.clone();
+        let active = self
+            .runtime
+            .runner_registry
+            .begin_project_unregister(access.as_ref(), project)
+            .await
+            .map_err(|_| api_error(409, "runner_retirement_conflict"))?;
+        let jobs_guard = ProjectUnregisterFence {
+            registry: self.runtime.runner_registry.clone(),
+            project: project.to_string(),
+        };
+        if active != 0 {
+            return Err(api_error(409, "active_jobs_conflict"));
+        }
+        let session_guard = self
+            .runtime
+            .sessions
+            .begin_managed_worktree_recovery_fence(project, operation_id)
+            .map_err(|_| api_error(409, "native_closeout_recovery_conflict"))?;
+        let (request_id, receiver) = self
+            .runtime
+            .runner_registry
+            .enqueue_native_closeout_receipt_for_instance(
+                client_id.clone(),
+                binding_json,
+                "server_native_closeout_recovery".to_string(),
+                &instance_id,
+            )
+            .await
+            .map_err(|_| api_error(503, "native_closeout_receipt_dispatch_indeterminate"))?;
+        let response = match tokio::time::timeout(Duration::from_secs(WAIT_SECS), receiver).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) | Err(_) => {
+                self.runtime
+                    .runner_registry
+                    .cancel_request(&request_id)
+                    .await;
+                return Err(api_error(503, "native_closeout_receipt_indeterminate"));
+            }
+        };
+        if response.request_id != request_id
+            || response.client_id != client_id
+            || response.error.is_some()
+        {
+            return Err(api_error(503, "native_closeout_receipt_indeterminate"));
+        }
+        let result: Value = serde_json::from_str(response.stdout.as_deref().unwrap_or(""))
+            .map_err(|_| api_error(503, "native_closeout_receipt_unverified"))?;
+        if !native_closeout_readonly_terminal_receipt_matches(
+            response.exit_code,
+            &result,
+            &project_id,
+            operation_id,
+            &revision,
+            &incarnation,
+        ) {
+            return Err(api_error(503, "native_closeout_receipt_unverified"));
+        }
+        self.runtime
+            .runner_registry
+            .reconcile_native_closeout_project_for_instance(
+                &client_id,
+                &instance_id,
+                &project_id,
+                &incarnation,
+            )
+            .await
+            .map_err(|_| api_error(503, "native_closeout_projection_indeterminate"))?;
+        self.runtime
+            .sessions
+            .reconcile_durable_managed_closeout_terminal(project, operation_id)
+            .map_err(|_| api_error(503, "native_closeout_release_indeterminate"))?;
+        drop(session_guard);
+        drop(jobs_guard);
+        Ok(ServiceResponse {
+            status: 200,
+            body: json!({
+                "outcome": "native_closeout_reconciled",
+                "project": project,
+                "operation_id": operation_id,
+                "status": "completed",
+                "source": "runner_verified_terminal_journal",
             }),
         })
     }
@@ -1847,6 +2050,53 @@ mod tests {
             "refs/heads/main"
         )
         .is_err());
+    }
+
+    #[test]
+    fn native_closeout_readonly_receipt_rejects_mutation_and_stale_identity() {
+        let receipt = json!({
+            "operation": "native_managed_closeout_receipt",
+            "outcome": "native_closeout_completed",
+            "changed": false,
+            "phase": "unregistered",
+            "agent_project_id": "managed-child",
+            "operation_id": "operation-1",
+            "expected_revision": "sha256:revision",
+            "registration_incarnation": "incarnation-1",
+        });
+        let valid = |value: &Value| {
+            native_closeout_readonly_terminal_receipt_matches(
+                Some(0),
+                value,
+                "managed-child",
+                "operation-1",
+                "sha256:revision",
+                "incarnation-1",
+            )
+        };
+        assert!(valid(&receipt));
+        for (field, replacement) in [
+            ("operation", json!("native_managed_closeout")),
+            ("outcome", json!("native_closeout_admission_observed")),
+            ("changed", json!(true)),
+            ("phase", json!("git_removed")),
+            ("agent_project_id", json!("another-child")),
+            ("operation_id", json!("another-operation")),
+            ("expected_revision", json!("sha256:another")),
+            ("registration_incarnation", json!("incarnation-2")),
+        ] {
+            let mut wrong = receipt.clone();
+            wrong[field] = replacement;
+            assert!(!valid(&wrong), "must reject {field}");
+        }
+        assert!(!native_closeout_readonly_terminal_receipt_matches(
+            Some(1),
+            &receipt,
+            "managed-child",
+            "operation-1",
+            "sha256:revision",
+            "incarnation-1",
+        ));
     }
 
     #[test]
