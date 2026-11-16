@@ -98,6 +98,13 @@ fn native_closeout_atomic_descriptor_survives_restart_and_exact_release() {
     drop(first);
 
     let restarted = persistent_store(ledger.clone());
+    let pending = restarted
+        .pending_managed_worktree_recovery_bindings()
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0, project);
+    assert_eq!(pending[0].1, "operation-1");
+    assert_eq!(pending[0].2, payload);
     assert_eq!(
         restarted.durable_managed_worktree_closeout(project),
         Some("operation-1".into())
@@ -135,6 +142,10 @@ fn native_closeout_atomic_descriptor_survives_restart_and_exact_release() {
     drop(restarted);
     let reopened = persistent_store(ledger);
     assert_eq!(reopened.durable_managed_worktree_closeout(project), None);
+    assert!(reopened
+        .pending_managed_worktree_recovery_bindings()
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -157,6 +168,12 @@ fn native_closeout_recovery_reacquires_only_same_operation_without_unblocking_se
     drop(first);
 
     let resumed = persistent_store(ledger.clone());
+    assert_eq!(
+        resumed
+            .pending_managed_worktree_recovery_bindings()
+            .unwrap_err(),
+        "durable_closeout_binding_missing"
+    );
     assert_eq!(
         resumed
             .begin_managed_worktree_recovery_fence(project, "operation-2")

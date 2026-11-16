@@ -1222,6 +1222,43 @@ impl SessionStore {
             .map_err(|_| "durable_closeout_binding_unavailable".into())
     }
 
+    /// Read-only startup inventory for the existing Native Closeout Owner.
+    /// A durable lease without an exact bound descriptor is NOT recoverable:
+    /// refuse the entire scan rather than silently skipping that Project.
+    /// This never creates a Session, grants admin authority, dispatches Runner
+    /// operations, or releases any durable block.
+    pub fn pending_managed_worktree_recovery_bindings(
+        &self,
+    ) -> Result<Vec<(String, String, String)>, String> {
+        let inner = self.inner.lock().map_err(|_| "session_store_unavailable")?;
+        let database = inner
+            .persistence
+            .as_ref()
+            .ok_or("durable_closeout_requires_database")?
+            .database
+            .clone();
+        let mut pending = Vec::with_capacity(inner.durable_closeout_projects.len());
+        for (project, operation_id) in &inner.durable_closeout_projects {
+            if !inner.unregistering_projects.contains(project) {
+                return Err("durable_closeout_admission_fence_missing".into());
+            }
+            let json = database
+                .managed_closeout_binding(project, operation_id)
+                .map_err(|_| "durable_closeout_binding_unavailable")?
+                .ok_or("durable_closeout_binding_missing")?;
+            let payload: serde_json::Value =
+                serde_json::from_str(&json).map_err(|_| "durable_closeout_binding_invalid")?;
+            if payload.get("operation_id").and_then(|v| v.as_str()) != Some(operation_id.as_str())
+                || payload.get("phase").and_then(|v| v.as_str()) != Some("prepared")
+                || payload.get("project_id").and_then(|v| v.as_str()).is_none()
+            {
+                return Err("durable_closeout_binding_invalid".into());
+            }
+            pending.push((project.clone(), operation_id.clone(), json));
+        }
+        Ok(pending)
+    }
+
     /// Exact terminal closeout reconciliation, internal to this Session
     /// domain. The trusted Server Native Owner must validate the Runner
     /// registration-incarnation, job completion and durable Git-removed
