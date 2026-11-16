@@ -140,9 +140,13 @@ impl NativeManagedCloseoutFences {
     /// while the Runner Job-start fence remains held. This only prepares
     /// execution ownership; it is never a delete authorization by itself.
     #[allow(dead_code)]
-    pub(crate) fn persist_owner_intent(&self, operation_id: &str) -> Result<(), ServiceResponse> {
+    pub(crate) fn persist_owner_intent(
+        &self,
+        operation_id: &str,
+        payload_json: &str,
+    ) -> Result<(), ServiceResponse> {
         self._sessions
-            .persist_managed_closeout(operation_id)
+            .persist_managed_closeout_with_binding(operation_id, payload_json)
             .map_err(|_| api_error(503, "native_closeout_durable_intent_unverified"))
     }
 }
@@ -464,9 +468,9 @@ impl AdminProjectLifecycleService {
             Some(&intent.operation_id),
         )
         .await?;
-        guards.persist_owner_intent(&intent.operation_id)?;
         let payload_json =
             serde_json::to_string(&payload).map_err(|_| api_error(500, "operation_failed"))?;
+        guards.persist_owner_intent(&intent.operation_id, &payload_json)?;
         let (request_id, receiver) = self
             .runtime
             .runner_registry

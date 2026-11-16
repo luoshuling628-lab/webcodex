@@ -212,6 +212,80 @@ impl SessionProjectUnregisterGuard {
             .insert(self.project.clone(), operation_id.to_string());
         Ok(())
     }
+    /// Atomic durable reservation of the exact, validated Runner request.
+    /// The descriptor and Session exclusion share one SQLite transaction;
+    /// a crash cannot leave a new operation ID without its recovery identity.
+    pub fn persist_managed_closeout_with_binding(
+        &self,
+        operation_id: &str,
+        payload_json: &str,
+    ) -> Result<(), String> {
+        if operation_id.is_empty()
+            || operation_id.len() > 128
+            || !operation_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || payload_json.len() > 8192
+        {
+            return Err("invalid_durable_closeout_identity".into());
+        }
+        let payload: serde_json::Value =
+            serde_json::from_str(payload_json).map_err(|_| "invalid_durable_closeout_binding")?;
+        if payload
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(operation_id)
+            || payload
+                .get("project_id")
+                .and_then(serde_json::Value::as_str)
+                != self.project.rsplit(':').next()
+            || payload.get("phase").and_then(serde_json::Value::as_str) != Some("prepared")
+            || payload
+                .get("expected_incarnation")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            || payload
+                .get("expected_head")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+        {
+            return Err("invalid_durable_closeout_binding".into());
+        }
+        let mut inner = self
+            .store
+            .inner
+            .lock()
+            .map_err(|_| "session_store_unavailable")?;
+        if !inner.unregistering_projects.contains(&self.project) {
+            return Err("native_closeout_transient_fence_missing".into());
+        }
+        if let Some(current) = inner.durable_closeout_projects.get(&self.project) {
+            if current != operation_id {
+                return Err("durable_closeout_operation_conflict".into());
+            }
+        } else if !inner.sessions.values().any(|entry| {
+            entry.project() == Some(self.project.as_str())
+                && entry.lifecycle() == SessionLifecycle::Closed
+        }) || inner.sessions.values().any(|entry| {
+            entry.project() == Some(self.project.as_str())
+                && entry.lifecycle() == SessionLifecycle::Active
+        }) {
+            return Err("native_closeout_sessions_not_closed".into());
+        }
+        let database = inner
+            .persistence
+            .as_ref()
+            .ok_or("durable_closeout_requires_database")?
+            .database
+            .clone();
+        database
+            .reserve_managed_closeout_with_binding(&self.project, operation_id, payload_json)
+            .map_err(|_| "durable_closeout_binding_commit_uncertain")?;
+        inner
+            .durable_closeout_projects
+            .insert(self.project.clone(), operation_id.to_string());
+        Ok(())
+    }
 }
 
 impl Drop for SessionProjectUnregisterGuard {
@@ -1118,6 +1192,34 @@ impl SessionStore {
     pub fn durable_managed_worktree_closeout(&self, project: &str) -> Option<String> {
         let inner = self.inner.lock().ok()?;
         inner.durable_closeout_projects.get(project).cloned()
+    }
+
+    /// Cold-start exact-binding lookup. A Session lease without a matching
+    /// committed descriptor remains blocked; it must not be reconstructed
+    /// from a missing Project inventory row or a guessed Git remote.
+    pub fn durable_managed_worktree_binding(
+        &self,
+        project: &str,
+        operation_id: &str,
+    ) -> Result<Option<String>, String> {
+        let inner = self.inner.lock().map_err(|_| "session_store_unavailable")?;
+        if inner
+            .durable_closeout_projects
+            .get(project)
+            .map(String::as_str)
+            != Some(operation_id)
+        {
+            return Err("durable_closeout_operation_conflict".into());
+        }
+        let database = inner
+            .persistence
+            .as_ref()
+            .ok_or("durable_closeout_requires_database")?
+            .database
+            .clone();
+        database
+            .managed_closeout_binding(project, operation_id)
+            .map_err(|_| "durable_closeout_binding_unavailable".into())
     }
 
     /// Exact terminal closeout reconciliation, internal to this Session

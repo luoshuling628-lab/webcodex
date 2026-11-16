@@ -53,6 +53,91 @@ fn session_tool_contract(tool_name: &str) -> SessionToolContract {
 }
 
 #[test]
+fn native_closeout_atomic_descriptor_survives_restart_and_exact_release() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("native-bound-recovery.json");
+    let project = "agent:runner:managed-child";
+    let first = persistent_store(ledger.clone());
+    let session = first.start_session_with_guards(
+        Some(project.into()),
+        Some("closed".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    first.close_session(&session.session_id).unwrap();
+    first.flush_persistence();
+    let guard = first.begin_managed_worktree_cleanup_fence(project).unwrap();
+    let payload = serde_json::json!({
+        "operation_id": "operation-1",
+        "project_id": "managed-child",
+        "phase": "prepared",
+        "expected_incarnation": "incarnation-1",
+        "expected_head": "a".repeat(40),
+        "expected_revision": "sha256:revision",
+        "source_root": "/source",
+        "worktree_root": "/child",
+        "expected_origin_url": "/remote",
+        "expected_remote_ref": "refs/heads/main",
+    })
+    .to_string();
+    assert!(guard
+        .persist_managed_closeout_with_binding("operation-1", "{")
+        .is_err());
+    assert_eq!(first.durable_managed_worktree_closeout(project), None);
+    guard
+        .persist_managed_closeout_with_binding("operation-1", &payload)
+        .unwrap();
+    assert!(guard
+        .persist_managed_closeout_with_binding("operation-1", &payload)
+        .is_ok());
+    let other = payload.replace("refs/heads/main", "refs/heads/other");
+    assert!(guard
+        .persist_managed_closeout_with_binding("operation-1", &other)
+        .is_err());
+    drop(guard);
+    drop(first);
+
+    let restarted = persistent_store(ledger.clone());
+    assert_eq!(
+        restarted.durable_managed_worktree_closeout(project),
+        Some("operation-1".into())
+    );
+    assert_eq!(
+        restarted
+            .durable_managed_worktree_binding(project, "operation-1")
+            .unwrap(),
+        Some(payload.clone())
+    );
+    assert!(restarted
+        .durable_managed_worktree_binding(project, "operation-stale")
+        .is_err());
+    let resume = restarted
+        .begin_managed_worktree_recovery_fence(project, "operation-1")
+        .unwrap();
+    resume
+        .persist_managed_closeout_with_binding("operation-1", &payload)
+        .unwrap();
+    drop(resume);
+    assert!(restarted
+        .start_session_with_options(crate::SessionCreateOptions::new(
+            Some(project.into()),
+            Some("still fenced".into()),
+            SessionMode::ReadOnly,
+            SessionGuards::default(),
+        ))
+        .is_err());
+    restarted
+        .reconcile_durable_managed_closeout_terminal(project, "operation-1")
+        .unwrap();
+    assert!(restarted
+        .durable_managed_worktree_binding(project, "operation-1")
+        .is_err());
+    drop(restarted);
+    let reopened = persistent_store(ledger);
+    assert_eq!(reopened.durable_managed_worktree_closeout(project), None);
+}
+
+#[test]
 fn native_closeout_recovery_reacquires_only_same_operation_without_unblocking_sessions() {
     let temp = tempfile::tempdir().unwrap();
     let ledger = temp.path().join("native-recovery.json");
