@@ -63,6 +63,10 @@ impl PendingDispatchFence {
                         kind: webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseout,
                         ..
                     })
+                    | RunnerOperation::Project(webcodex_core::runner_operation::RunnerProjectOperation {
+                        kind: webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseoutReceipt,
+                        ..
+                    })
                     | RunnerOperation::RunnerInstruction(_)
                     | RunnerOperation::RunnerConfig(_)
                     | RunnerOperation::SshResource(_)
@@ -73,8 +77,11 @@ impl PendingDispatchFence {
                 RunnerOperation::Project(operation),
             ) => {
                 !runner_instance_id.is_empty()
-                    && operation.kind
-                        == webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseout
+                    && matches!(
+                        operation.kind,
+                        webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseout
+                            | webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseoutReceipt
+                    )
             }
             (Self::Project(fence), RunnerOperation::File(_)) => {
                 !fence.project_id.is_empty()

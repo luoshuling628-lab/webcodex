@@ -148,6 +148,57 @@ pub(super) fn advance(
     Ok(updated)
 }
 
+/// Independent read-only reconciliation against the exact immutable Runner
+/// intent, its durable terminal phase, current registration, and Git worktree
+/// membership. Never trusts a missing directory or a journal phase alone.
+/// The existing Runner registry lock excludes concurrent register/unregister.
+#[allow(dead_code)]
+pub(super) fn read_verified_terminal(
+    registry: &Path,
+    expected: &NativeCloseoutRecord,
+) -> Result<NativeCloseoutRecord, &'static str> {
+    validate_record(expected)?;
+    if expected.phase != CloseoutPhase::Prepared {
+        return Err("native_closeout_invalid_phase");
+    }
+    let _lock = super::project_registry_write_lock()
+        .lock()
+        .map_err(|_| "native_closeout_registry_lock_failed")?;
+    let registry = super::super::shell::canonicalize_existing(registry)
+        .map_err(|_| "native_closeout_registry_missing")?;
+    // A missing journal is NOT evidence of completion; do not fabricate it.
+    let bytes = fs::read(ledger_path(&registry, expected))
+        .map_err(|_| "native_closeout_terminal_not_proven")?;
+    let saved: NativeCloseoutRecord =
+        serde_json::from_slice(&bytes).map_err(|_| "native_closeout_journal_indeterminate")?;
+    validate_record(&saved)?;
+    let mut normalized = saved.clone();
+    normalized.phase = CloseoutPhase::Prepared;
+    if &normalized != expected {
+        return Err("native_closeout_idempotency_conflict");
+    }
+    if saved.phase != CloseoutPhase::Unregistered {
+        return Err("native_closeout_terminal_not_proven");
+    }
+    if fs::symlink_metadata(&saved.worktree_root).is_ok()
+        || registry.join(format!("{}.toml", saved.project_id)).exists()
+    {
+        return Err("native_closeout_terminal_state_conflict");
+    }
+    let source = super::super::shell::canonicalize_existing(Path::new(&saved.source_root))
+        .map_err(|_| "native_closeout_source_missing")?;
+    if source != Path::new(&saved.source_root)
+        || super::managed_worktree::source_mentions_worktree_path(
+            &source,
+            Path::new(&saved.worktree_root),
+        )
+        .unwrap_or(true)
+    {
+        return Err("native_closeout_git_state_indeterminate");
+    }
+    Ok(saved)
+}
+
 /// Runner-side effect transaction. This is intentionally not a dispatchable
 /// Runner operation: the Server must first bind a continuously held, exact
 /// Session + Job fence and prove terminal processes/leases. The existing
@@ -399,6 +450,10 @@ mod tests {
             super::super::super::ssh::SshConnectionPool::default(),
         );
 
+        assert_eq!(
+            read_verified_terminal(&registry, &candidate).unwrap_err(),
+            "native_closeout_terminal_not_proven"
+        );
         fs::write(child.join("unique.txt"), "do not delete").unwrap();
         assert_eq!(
             super::super::execute_native_closeout_under_runner_fences(
@@ -422,6 +477,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(done.phase, CloseoutPhase::Unregistered);
+        assert_eq!(read_verified_terminal(&registry, &candidate).unwrap(), done);
+        // An interrupted transaction or a recreated Project registration
+        // must never be accepted as a completed recovery receipt.
+        let receipt_path = ledger_path(&registry, &candidate);
+        let receipt = fs::read(&receipt_path).unwrap();
+        let mut interrupted = done.clone();
+        interrupted.phase = CloseoutPhase::GitRemoved;
+        fs::write(&receipt_path, serde_json::to_vec(&interrupted).unwrap()).unwrap();
+        assert_eq!(
+            read_verified_terminal(&registry, &candidate).unwrap_err(),
+            "native_closeout_terminal_not_proven"
+        );
+        fs::write(&receipt_path, &receipt).unwrap();
+        fs::write(registry.join("fixture-child.toml"), &managed).unwrap();
+        assert_eq!(
+            read_verified_terminal(&registry, &candidate).unwrap_err(),
+            "native_closeout_terminal_state_conflict"
+        );
+        fs::remove_file(registry.join("fixture-child.toml")).unwrap();
+        assert_eq!(read_verified_terminal(&registry, &candidate).unwrap(), done);
+        let query = webcodex_core::runner_operation::RunnerProjectOperation {
+            kind: webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseoutReceipt,
+            payload: serde_json::to_string(&candidate).unwrap(),
+        };
+        let observed = super::super::handle_native_closeout_receipt_operation(&registry, &query);
+        assert_eq!(observed.exit_code, Some(0));
+        let receipt_json: serde_json::Value =
+            serde_json::from_str(observed.stdout.as_deref().unwrap()).unwrap();
+        assert_eq!(receipt_json["operation"], "native_managed_closeout_receipt");
+        assert_eq!(receipt_json["changed"], false);
+        assert_eq!(receipt_json["phase"], "unregistered");
         assert!(!child.exists());
         assert!(!registry.join("fixture-child.toml").exists());
         assert_eq!(
@@ -437,6 +523,10 @@ mod tests {
         );
         let mut conflict = candidate;
         conflict.expected_head = "b".repeat(40);
+        assert_eq!(
+            read_verified_terminal(&registry, &conflict).unwrap_err(),
+            "native_closeout_idempotency_conflict"
+        );
         assert_eq!(
             super::super::execute_native_closeout_under_runner_fences(
                 &policy, &registry, &jobs, &shells, conflict

@@ -81,9 +81,9 @@ pub(crate) use output::{err_cmd, ok_cmd, CommandResult, ShellCommandResult};
 pub(crate) use patches::is_structured_edit_request_kind;
 pub(crate) use persistent_shell::PersistentShellManager;
 pub(crate) use projects::{
-    handle_native_managed_closeout_operation, handle_prepare_managed_worktree_operation,
-    handle_project_lifecycle_operation, handle_project_operation,
-    handle_resolve_or_register_project_operation,
+    handle_native_closeout_receipt_operation, handle_native_managed_closeout_operation,
+    handle_prepare_managed_worktree_operation, handle_project_lifecycle_operation,
+    handle_project_operation, handle_resolve_or_register_project_operation,
 };
 #[cfg(test)]
 pub(crate) use projects::{

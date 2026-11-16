@@ -253,6 +253,37 @@ async fn native_closeout_dispatch_pins_exact_runner_instance_and_capability() {
         "ordinary project tools must never enqueue deletion"
     );
 
+    assert!(
+        registry
+            .enqueue_project_op(
+                "runner-closeout".to_string(),
+                "native_managed_closeout_receipt",
+                "{}".to_string(),
+                "unfenced-observer".to_string(),
+            )
+            .await
+            .is_err(),
+        "receipt must also require exact instance fence"
+    );
+    let (receipt_id, _receipt_response) = registry
+        .enqueue_native_closeout_receipt_for_instance(
+            "runner-closeout".to_string(),
+            "{}".to_string(),
+            "server-native-owner".to_string(),
+            "instance-1",
+        )
+        .await
+        .expect("read-only receipt lookup admitted for exact instance");
+    {
+        let inner = registry.inner.lock().await;
+        let pending = inner.pending_by_id.get(&receipt_id).unwrap();
+        assert!(matches!(
+            &pending.dispatch_fence,
+            crate::dispatch_fence::PendingDispatchFence::NativeCloseout { runner_instance_id }
+                if runner_instance_id == "instance-1"
+        ));
+    }
+
     let accepted = registry
         .enqueue_native_closeout_for_instance(
             "runner-closeout".to_string(),

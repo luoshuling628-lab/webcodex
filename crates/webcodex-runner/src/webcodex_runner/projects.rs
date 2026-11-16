@@ -89,6 +89,43 @@ pub(crate) fn handle_native_managed_closeout_operation(
     }
 }
 
+/// Recovery observation never invokes a Git removal, unregister, or journal
+/// phase transition. It only returns an exact already-committed terminal.
+#[allow(dead_code)]
+pub(crate) fn handle_native_closeout_receipt_operation(
+    registry: &std::path::Path,
+    operation: &webcodex_core::runner_operation::RunnerProjectOperation,
+) -> CommandResult {
+    let start = Instant::now();
+    if operation.kind
+        != webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseoutReceipt
+        || operation.payload.len() > 8192
+    {
+        return project_error_cmd(start, "native_closeout_invalid_request");
+    }
+    let expected: native_closeout::NativeCloseoutRecord =
+        match serde_json::from_str(&operation.payload) {
+            Ok(value) => value,
+            Err(_) => return project_error_cmd(start, "native_closeout_invalid_request"),
+        };
+    match native_closeout::read_verified_terminal(registry, &expected) {
+        Ok(receipt) => crate::webcodex_runner::output::ok_cmd(
+            start,
+            serde_json::json!({
+                "operation": "native_managed_closeout_receipt",
+                "outcome": "native_closeout_completed",
+                "changed": false,
+                "agent_project_id": receipt.project_id,
+                "operation_id": receipt.operation_id,
+                "expected_revision": receipt.expected_revision,
+                "registration_incarnation": receipt.expected_incarnation,
+                "phase": receipt.phase,
+            }),
+        ),
+        Err(reason) => project_error_cmd(start, reason),
+    }
+}
+
 pub(crate) fn execute_native_closeout_under_runner_fences(
     policy: &super::config::RunnerPolicy,
     registry: &std::path::Path,

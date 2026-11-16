@@ -2465,6 +2465,29 @@ impl RunnerRegistry {
         .await
     }
 
+    /// Read-only terminal receipt query, pinned to one exact Runner instance.
+    /// Missing / nonterminal receipts are reported as failures; this request
+    /// never invokes Git removal or changes the Session lease.
+    pub async fn enqueue_native_closeout_receipt_for_instance(
+        &self,
+        client_id: String,
+        payload: String,
+        requested_by: String,
+        expected_runner_instance_id: &str,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        if expected_runner_instance_id.is_empty() {
+            return Err("native_closeout_runner_instance_missing".to_string());
+        }
+        self.enqueue_project_op_checked(
+            client_id,
+            "native_managed_closeout_receipt",
+            payload,
+            requested_by,
+            Some(expected_runner_instance_id),
+        )
+        .await
+    }
+
     async fn enqueue_project_op_checked(
         &self,
         client_id: String,
@@ -2481,6 +2504,7 @@ impl RunnerRegistry {
                 | "resolve_or_register_project"
                 | "prepare_managed_worktree"
                 | "native_managed_closeout"
+                | "native_managed_closeout_receipt"
                 | "project_lifecycle_enable"
                 | "project_lifecycle_disable"
                 | "project_lifecycle_unregister"
@@ -2494,7 +2518,9 @@ impl RunnerRegistry {
         let required_feature = match kind {
             "resolve_or_register_project" => Some(RunnerFeature::ProjectPathRegistration),
             "prepare_managed_worktree" => Some(RunnerFeature::ManagedWorktree),
-            "native_managed_closeout" => Some(RunnerFeature::NativeManagedCloseout),
+            "native_managed_closeout" | "native_managed_closeout_receipt" => {
+                Some(RunnerFeature::NativeManagedCloseout)
+            }
             "project_lifecycle_enable"
             | "project_lifecycle_disable"
             | "project_lifecycle_unregister" => Some(RunnerFeature::ProjectLifecycle),
