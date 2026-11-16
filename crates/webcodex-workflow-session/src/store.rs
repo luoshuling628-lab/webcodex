@@ -221,6 +221,7 @@ impl Drop for SessionProjectUnregisterGuard {
             .inner
             .lock()
             .expect("session store mutex poisoned");
+        inner.recovering_closeouts.remove(&self.project);
         if !inner.durable_closeout_projects.contains_key(&self.project) {
             inner.unregistering_projects.remove(&self.project);
         }
@@ -233,6 +234,7 @@ pub(super) struct SessionStoreInner {
     sessions: SessionRecords,
     unregistering_projects: BTreeSet<String>,
     durable_closeout_projects: BTreeMap<String, String>,
+    recovering_closeouts: BTreeSet<String>,
     lru: SessionRecency,
     hot_session_capacity_target: usize,
     cache_target_bytes: usize,
@@ -270,6 +272,7 @@ impl SessionStore {
                 sessions: SessionRecords::default(),
                 unregistering_projects: BTreeSet::new(),
                 durable_closeout_projects: BTreeMap::new(),
+                recovering_closeouts: BTreeSet::new(),
                 lru: SessionRecency::default(),
                 hot_session_capacity_target,
                 cache_target_bytes: DEFAULT_SESSION_CACHE_BYTES,
@@ -369,6 +372,7 @@ impl SessionStore {
             },
             unregistering_projects: durable_closeout_blocked,
             durable_closeout_projects,
+            recovering_closeouts: BTreeSet::new(),
             lru,
             hot_session_capacity_target: DEFAULT_MAX_SESSIONS,
             cache_target_bytes,
@@ -1191,6 +1195,42 @@ impl SessionStore {
             }
         }
         inner.unregistering_projects.insert(project.to_string());
+        Ok(SessionProjectUnregisterGuard {
+            store: self.clone(),
+            project: project.to_string(),
+        })
+    }
+
+    /// Resume an already-persisted native closeout after Server restart or
+    /// transport ambiguity, without ever clearing its Session admission block.
+    /// Exact operation identity is mandatory; one recovery owner per Project
+    /// may hold this transient guard. This does not itself authorize deletion
+    /// or replace the Runner's separate Job-start fence.
+    pub fn begin_managed_worktree_recovery_fence(
+        &self,
+        project: &str,
+        operation_id: &str,
+    ) -> Result<SessionProjectUnregisterGuard, String> {
+        let mut inner = self.inner.lock().map_err(|_| "session_store_unavailable")?;
+        match inner.durable_closeout_projects.get(project) {
+            Some(saved) if saved == operation_id => {}
+            Some(_) => return Err("durable_closeout_operation_conflict".to_string()),
+            None => return Err("durable_closeout_not_reserved".to_string()),
+        }
+        if !inner.unregistering_projects.contains(project) {
+            return Err("durable_closeout_admission_fence_missing".to_string());
+        }
+        if inner.recovering_closeouts.contains(project) {
+            return Err("native_closeout_recovery_already_in_progress".to_string());
+        }
+        if inner.sessions.values().any(|entry| {
+            entry.project() == Some(project) && entry.lifecycle() == SessionLifecycle::Active
+        }) {
+            return Err("managed_worktree_active_sessions".to_string());
+        }
+        // Only the transient recovery lock is new. Durable blocks and SQLite
+        // identity remain unchanged until trusted terminal reconciliation.
+        inner.recovering_closeouts.insert(project.to_string());
         Ok(SessionProjectUnregisterGuard {
             store: self.clone(),
             project: project.to_string(),

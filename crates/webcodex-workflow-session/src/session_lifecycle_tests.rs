@@ -53,6 +53,88 @@ fn session_tool_contract(tool_name: &str) -> SessionToolContract {
 }
 
 #[test]
+fn native_closeout_recovery_reacquires_only_same_operation_without_unblocking_sessions() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("native-recovery.json");
+    let project = "agent:runner:managed-child";
+    let first = persistent_store(ledger.clone());
+    let session = first.start_session_with_guards(
+        Some(project.into()),
+        Some("finished".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    first.close_session(&session.session_id).unwrap();
+    first.flush_persistence();
+    let admission = first.begin_managed_worktree_cleanup_fence(project).unwrap();
+    admission.persist_managed_closeout("operation-1").unwrap();
+    drop(admission);
+    drop(first);
+
+    let resumed = persistent_store(ledger.clone());
+    assert_eq!(
+        resumed
+            .begin_managed_worktree_recovery_fence(project, "operation-2")
+            .err()
+            .unwrap(),
+        "durable_closeout_operation_conflict"
+    );
+    let recovered = resumed
+        .begin_managed_worktree_recovery_fence(project, "operation-1")
+        .expect("exact previous owner recovers");
+    assert_eq!(
+        resumed
+            .begin_managed_worktree_recovery_fence(project, "operation-1")
+            .err()
+            .unwrap(),
+        "native_closeout_recovery_already_in_progress"
+    );
+    assert!(resumed
+        .start_session_with_options(crate::SessionCreateOptions::new(
+            Some(project.into()),
+            Some("blocked during recovery".into()),
+            SessionMode::ReadOnly,
+            SessionGuards::default(),
+        ))
+        .is_err());
+    drop(recovered);
+    assert_eq!(
+        resumed.durable_managed_worktree_closeout(project),
+        Some("operation-1".into())
+    );
+    assert!(resumed
+        .start_session_with_options(crate::SessionCreateOptions::new(
+            Some(project.into()),
+            Some("still blocked after crash".into()),
+            SessionMode::ReadOnly,
+            SessionGuards::default(),
+        ))
+        .is_err());
+    let second = resumed
+        .begin_managed_worktree_recovery_fence(project, "operation-1")
+        .expect("same owner may retry after cancellation");
+    drop(second);
+    drop(resumed);
+
+    let restarted = persistent_store(ledger);
+    assert_eq!(
+        restarted.durable_managed_worktree_closeout(project),
+        Some("operation-1".into())
+    );
+    let third = restarted
+        .begin_managed_worktree_recovery_fence(project, "operation-1")
+        .expect("same owner may recover after a second process restart");
+    drop(third);
+    assert_eq!(
+        restarted
+            .begin_managed_worktree_recovery_fence(project, "operation-2")
+            .err()
+            .unwrap(),
+        "durable_closeout_operation_conflict"
+    );
+}
+
+#[test]
 fn native_closeout_terminal_release_requires_exact_durable_cas_and_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("reconcile.json");

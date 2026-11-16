@@ -277,6 +277,7 @@ pub(crate) async fn begin_native_managed_closeout_fences(
     auth: &AuthContext,
     target: &str,
     expected_revision: &str,
+    recovery_operation_id: Option<&str>,
 ) -> Result<NativeManagedCloseoutFences, ServiceResponse> {
     if !admin_project_mutation_authorized(auth) {
         return Err(api_error(403, "admin_authority_required"));
@@ -330,10 +331,22 @@ pub(crate) async fn begin_native_managed_closeout_fences(
     if active_jobs != 0 {
         return Err(api_error(409, "active_jobs_conflict"));
     }
-    let sessions_guard = runtime
-        .sessions
-        .begin_managed_worktree_cleanup_fence(target)
-        .map_err(|_| api_error(409, "native_sessions_not_durably_closed"))?;
+    // A previously committed operation may reacquire its exact Session
+    // recovery guard after a Server restart; all unrelated operations remain
+    // blocked. Never clear the durable reservation as a recovery shortcut.
+    let sessions_guard = match (
+        recovery_operation_id,
+        runtime.sessions.durable_managed_worktree_closeout(target),
+    ) {
+        (Some(operation_id), Some(_)) => runtime
+            .sessions
+            .begin_managed_worktree_recovery_fence(target, operation_id),
+        (None, Some(_)) => Err("durable_closeout_recovery_identity_required".to_string()),
+        (_, None) => runtime
+            .sessions
+            .begin_managed_worktree_cleanup_fence(target),
+    }
+    .map_err(|_| api_error(409, "native_sessions_not_durably_closed"))?;
     // Ensure the SessionStore's durable closure evidence is committed before
     // any future caller can even consider Runner-side physical removal.
     runtime
@@ -448,6 +461,7 @@ impl AdminProjectLifecycleService {
             auth,
             &intent.project,
             &intent.expected_revision,
+            Some(&intent.operation_id),
         )
         .await?;
         guards.persist_owner_intent(&intent.operation_id)?;
@@ -529,6 +543,7 @@ impl AdminProjectLifecycleService {
             auth,
             &request.project,
             &request.expected_revision,
+            None,
         )
         .await
         {
