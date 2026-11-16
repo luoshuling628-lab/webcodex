@@ -347,6 +347,18 @@ pub(crate) async fn begin_native_managed_closeout_fences(
     })
 }
 
+/// Internal-only execution input produced by the trusted Native Owner
+/// after independent source/remote recovery verification. Not an HTTP body:
+/// user-provided origin URLs or branch names must never become delete authority.
+#[allow(dead_code)]
+struct VerifiedNativeCloseoutIntent {
+    project: String,
+    expected_revision: String,
+    operation_id: String,
+    verified_origin_url: String,
+    verified_remote_ref: String,
+}
+
 #[derive(Clone)]
 pub(crate) struct AdminProjectLifecycleService {
     runtime: Arc<ToolRuntime>,
@@ -356,6 +368,151 @@ pub(crate) struct AdminProjectLifecycleService {
 impl AdminProjectLifecycleService {
     pub(crate) fn new(runtime: Arc<ToolRuntime>, db: Arc<Database>) -> Self {
         Self { runtime, db }
+    }
+
+    /// Protected Owner execution path. This is deliberately not routed from
+    /// HTTP or a generic tool until independent release admission is complete.
+    /// The old Runner advertises no NativeCloseout capability, so no deletion
+    /// can be dispatched to production. Never release a durable Session lease
+    /// on a timeout, transport error, or an untrusted/unmatched result.
+    #[allow(dead_code)]
+    async fn execute_native_closeout_bound(
+        &self,
+        auth: &AuthContext,
+        intent: VerifiedNativeCloseoutIntent,
+    ) -> Result<ServiceResponse, ServiceResponse> {
+        if !admin_project_mutation_authorized(auth) {
+            return Err(api_error(403, "admin_authority_required"));
+        }
+        validate_revision(&intent.expected_revision)?;
+        let (client_id, project_id) = parse_runtime_project(&intent.project)?;
+        let access = crate::runner_http::runner_access_from_auth(Some(auth));
+        self.runtime
+            .runner_registry
+            .assert_runner_access(access.as_ref(), &client_id)
+            .await
+            .map_err(|_| api_error(403, "runner_access_denied"))?;
+        let client = self
+            .runtime
+            .runner_registry
+            .get_runner_semantic_view_for_auth(&client_id, access.as_ref())
+            .await
+            .ok_or_else(|| api_error(503, "agent_unavailable"))?;
+        if !client.view.connected
+            || client.view.status != "online"
+            || !client.supports(RunnerFeature::NativeManagedCloseout)
+            || !client
+                .view
+                .project_inventory
+                .as_ref()
+                .is_some_and(|inventory| inventory.sync_state == "complete")
+        {
+            return Err(api_error(409, "native_closeout_runner_not_admitted"));
+        }
+        let child = client
+            .view
+            .projects
+            .iter()
+            .find(|entry| entry.id == project_id)
+            .ok_or_else(|| api_error(404, "project_not_found"))?;
+        let source_id = match child.lineage.as_ref() {
+            Some(crate::runner_protocol::RunnerProjectLineage::ManagedWorktreeSource {
+                source_project_id,
+                ..
+            }) => source_project_id,
+            None => return Err(api_error(409, "native_closeout_source_unverified")),
+        };
+        let source = client
+            .view
+            .projects
+            .iter()
+            .find(|entry| entry.id == *source_id)
+            .ok_or_else(|| api_error(409, "native_closeout_source_unverified"))?;
+        let payload = native_closeout_bound_runner_payload(
+            child,
+            source,
+            &intent.expected_revision,
+            &intent.operation_id,
+            &intent.verified_origin_url,
+            &intent.verified_remote_ref,
+        )
+        .map_err(|_| api_error(409, "native_closeout_binding_unverified"))?;
+        let incarnation = child
+            .registration_incarnation
+            .as_deref()
+            .ok_or_else(|| api_error(409, "native_closeout_identity_unverified"))?
+            .to_string();
+        let instance_id = client.view.runner_instance_id.clone();
+        let guards = begin_native_managed_closeout_fences(
+            self.runtime.as_ref(),
+            auth,
+            &intent.project,
+            &intent.expected_revision,
+        )
+        .await?;
+        guards.persist_owner_intent(&intent.operation_id)?;
+        let payload_json =
+            serde_json::to_string(&payload).map_err(|_| api_error(500, "operation_failed"))?;
+        let (request_id, receiver) = self
+            .runtime
+            .runner_registry
+            .enqueue_native_closeout_for_instance(
+                client_id.clone(),
+                payload_json,
+                "server_native_closeout_owner".to_string(),
+                &instance_id,
+            )
+            .await
+            .map_err(|_| api_error(503, "native_closeout_dispatch_indeterminate"))?;
+        let response = match tokio::time::timeout(Duration::from_secs(WAIT_SECS), receiver).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) | Err(_) => {
+                self.runtime
+                    .runner_registry
+                    .cancel_request(&request_id)
+                    .await;
+                return Err(api_error(503, "native_closeout_execution_indeterminate"));
+            }
+        };
+        if response.request_id != request_id
+            || response.client_id != client_id
+            || response.error.is_some()
+        {
+            return Err(api_error(503, "native_closeout_execution_indeterminate"));
+        }
+        let output: Value = serde_json::from_str(response.stdout.as_deref().unwrap_or(""))
+            .map_err(|_| api_error(503, "native_closeout_receipt_unverified"))?;
+        if !native_closeout_terminal_receipt_matches(
+            response.exit_code,
+            &output,
+            &project_id,
+            &intent.operation_id,
+            &intent.expected_revision,
+            &incarnation,
+        ) {
+            return Err(api_error(503, "native_closeout_receipt_unverified"));
+        }
+        // The exact Runner incarnation must still own the Server projection.
+        // Keep the durable Session block on any CAS or SQLite ambiguity.
+        self.runtime
+            .runner_registry
+            .remove_runner_project_for_instance(&client_id, &instance_id, &project_id)
+            .await
+            .map_err(|_| api_error(503, "native_closeout_projection_indeterminate"))?;
+        self.runtime
+            .sessions
+            .reconcile_durable_managed_closeout_terminal(&intent.project, &intent.operation_id)
+            .map_err(|_| api_error(503, "native_closeout_release_indeterminate"))?;
+        drop(guards);
+        Ok(ServiceResponse {
+            status: 200,
+            body: json!({
+                "outcome": "native_closeout_completed",
+                "project": intent.project,
+                "operation_id": intent.operation_id,
+                "status": "completed",
+            }),
+        })
     }
 
     /// Make the existing Native Owner fences reachable through the protected

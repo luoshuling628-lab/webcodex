@@ -1122,7 +1122,7 @@ impl SessionStore {
     /// receipt BEFORE calling this function. A response body or a timeout is
     /// never itself proof. This primitive is not a public release API.
     #[allow(dead_code)]
-    pub(crate) fn reconcile_durable_managed_closeout_terminal(
+    pub fn reconcile_durable_managed_closeout_terminal(
         &self,
         project: &str,
         operation_id: &str,
