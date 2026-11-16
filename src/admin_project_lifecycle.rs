@@ -175,6 +175,83 @@ fn native_closeout_terminal_receipt_matches(
             == Some(incarnation)
 }
 
+/// Construct the exact Runner-side closeout candidate from two independently
+/// reported current Project inventory entries and an explicitly supplied,
+/// externally verified recovery ref. Neither a local HEAD nor an inferred
+/// default branch may fill in an absent recovery binding.
+#[allow(dead_code)]
+fn native_closeout_bound_runner_payload(
+    child: &RunnerProjectSummary,
+    source: &RunnerProjectSummary,
+    expected_revision: &str,
+    operation_id: &str,
+    verified_origin_url: &str,
+    verified_remote_ref: &str,
+) -> Result<Value, &'static str> {
+    use crate::runner_protocol::RunnerProjectLineage;
+    let RunnerProjectLineage::ManagedWorktreeSource {
+        source_project_id,
+        source_root_fingerprint,
+        base_sha,
+    } = child
+        .lineage
+        .as_ref()
+        .ok_or("native_closeout_lineage_missing")?;
+    let clean_sha =
+        |s: &str| matches!(s.len(), 40 | 64) && s.bytes().all(|c| c.is_ascii_hexdigit());
+    if !native_closeout_owner_identity_ready(child, expected_revision)
+        || child.id == source.id
+        || source.id != *source_project_id
+        || source.root_fingerprint.as_deref() != Some(source_root_fingerprint)
+        || child.git_head.as_deref() != Some(base_sha)
+        || !clean_sha(base_sha)
+        || uuid::Uuid::parse_str(operation_id).is_err()
+        || child.path.is_empty()
+        || source.path.is_empty()
+        || child.path == source.path
+        || !source.path.chars().all(|ch| !ch.is_control())
+        || !child.path.chars().all(|ch| !ch.is_control())
+        || verified_origin_url.trim() != verified_origin_url
+        || verified_origin_url.is_empty()
+        || verified_remote_ref.len() > 256
+        || !verified_remote_ref.starts_with("refs/heads/")
+        || verified_remote_ref.len() == "refs/heads/".len()
+        || verified_remote_ref.contains("..")
+        || verified_remote_ref
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || c == ':' || c == '\\')
+        || !verified_remote_ref["refs/heads/".len()..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+    {
+        return Err("native_closeout_binding_unverified");
+    }
+    let root = child
+        .root_fingerprint
+        .as_deref()
+        .ok_or("native_closeout_root_unverified")?;
+    let incarnation = child
+        .registration_incarnation
+        .as_deref()
+        .ok_or("native_closeout_incarnation_unverified")?;
+    if uuid::Uuid::parse_str(incarnation).is_err() {
+        return Err("native_closeout_incarnation_unverified");
+    }
+    Ok(json!({
+        "operation_id": operation_id,
+        "project_id": child.id,
+        "expected_revision": expected_revision,
+        "expected_incarnation": incarnation,
+        "expected_head": base_sha,
+        "expected_root_fingerprint": root,
+        "expected_origin_url": verified_origin_url,
+        "expected_remote_ref": verified_remote_ref,
+        "source_root": source.path,
+        "worktree_root": child.path,
+        "phase": "prepared"
+    }))
+}
+
 fn native_closeout_owner_identity_ready(
     project: &RunnerProjectSummary,
     expected_revision: &str,
@@ -1506,6 +1583,94 @@ mod tests {
             lifecycle_summary(&malformed, "demo").is_none(),
             "invalid registration identity must fail closed before a Registry update"
         );
+    }
+
+    #[test]
+    fn native_closeout_runner_payload_requires_exact_inventory_and_remote_binding() {
+        let incarnation = "11111111-1111-4111-8111-111111111111";
+        let operation_id = "22222222-2222-4222-8222-222222222222";
+        let sha = "a".repeat(40);
+        let child: RunnerProjectSummary = serde_json::from_value(json!({
+            "id": "child-one", "path": "/tmp/managed-child", "updated_at": 1,
+            "registration_source": "auto_registered",
+            "registration_incarnation": incarnation,
+            "root_fingerprint": "wc_projroot_child",
+            "revision": "sha256:revision",
+            "git_head": sha,
+            "git_dirty": false,
+            "lineage": {
+                "kind": "managed_worktree_source",
+                "source_project_id": "source-one",
+                "source_root_fingerprint": "wc_projroot_source",
+                "base_sha": sha
+            }
+        }))
+        .unwrap();
+        let source: RunnerProjectSummary = serde_json::from_value(json!({
+            "id": "source-one", "path": "/tmp/source", "updated_at": 1,
+            "root_fingerprint": "wc_projroot_source",
+            "git_head": sha, "git_dirty": false
+        }))
+        .unwrap();
+        let make =
+            |c: &RunnerProjectSummary, s: &RunnerProjectSummary, remote: &str, branch: &str| {
+                native_closeout_bound_runner_payload(
+                    c,
+                    s,
+                    "sha256:revision",
+                    operation_id,
+                    remote,
+                    branch,
+                )
+            };
+        let valid = make(
+            &child,
+            &source,
+            "https://github.com/example/repo.git",
+            "refs/heads/main",
+        )
+        .unwrap();
+        assert_eq!(valid["phase"], "prepared");
+        assert_eq!(valid["expected_incarnation"], incarnation);
+        assert_eq!(valid["source_root"], "/tmp/source");
+        assert_eq!(valid["expected_head"], sha);
+        assert!(make(&child, &source, "", "refs/heads/main").is_err());
+        assert!(make(&child, &source, "https://example.invalid", "HEAD").is_err());
+        assert!(make(&child, &source, "https://example.invalid", "refs/heads/").is_err());
+        assert!(make(
+            &child,
+            &source,
+            "https://example.invalid",
+            "refs/heads/../main"
+        )
+        .is_err());
+        let mut changed = child.clone();
+        changed.git_head = Some("b".repeat(40));
+        assert!(make(
+            &changed,
+            &source,
+            "https://example.invalid",
+            "refs/heads/main"
+        )
+        .is_err());
+        let mut changed_source = source.clone();
+        changed_source.root_fingerprint = Some("different".into());
+        assert!(make(
+            &child,
+            &changed_source,
+            "https://example.invalid",
+            "refs/heads/main"
+        )
+        .is_err());
+        let mut unregistered = child;
+        unregistered.registration_source = None;
+        assert!(make(
+            &unregistered,
+            &source,
+            "https://example.invalid",
+            "refs/heads/main"
+        )
+        .is_err());
     }
 
     #[test]
