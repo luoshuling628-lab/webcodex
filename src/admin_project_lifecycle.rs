@@ -135,6 +135,18 @@ pub(crate) struct NativeManagedCloseoutFences {
     _sessions: webcodex_workflow_session::SessionProjectUnregisterGuard,
 }
 
+impl NativeManagedCloseoutFences {
+    /// Upgrade the exact already-held Session fence to a durable reservation,
+    /// while the Runner Job-start fence remains held. This only prepares
+    /// execution ownership; it is never a delete authorization by itself.
+    #[allow(dead_code)]
+    pub(crate) fn persist_owner_intent(&self, operation_id: &str) -> Result<(), ServiceResponse> {
+        self._sessions
+            .persist_managed_closeout(operation_id)
+            .map_err(|_| api_error(503, "native_closeout_durable_intent_unverified"))
+    }
+}
+
 fn native_closeout_owner_identity_ready(
     project: &RunnerProjectSummary,
     expected_revision: &str,

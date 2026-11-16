@@ -157,6 +157,63 @@ pub struct SessionProjectUnregisterGuard {
     project: String,
 }
 
+impl SessionProjectUnregisterGuard {
+    /// Atomically upgrade this *already-held* native Session gate to a
+    /// restart-safe reservation. This does not authorize deletion or release
+    /// the Runner's separate Job-start fence. The guard remains held until
+    /// the caller drops it, while the durable block remains until terminal
+    /// reconciliation.
+    pub fn persist_managed_closeout(&self, operation_id: &str) -> Result<(), String> {
+        if operation_id.is_empty()
+            || operation_id.len() > 128
+            || !operation_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("invalid_durable_closeout_identity".to_string());
+        }
+        let mut inner = self
+            .store
+            .inner
+            .lock()
+            .map_err(|_| "session_store_unavailable")?;
+        if !inner.unregistering_projects.contains(&self.project) {
+            return Err("native_closeout_transient_fence_missing".to_string());
+        }
+        if let Some(current) = inner.durable_closeout_projects.get(&self.project) {
+            return if current == operation_id {
+                Ok(())
+            } else {
+                Err("durable_closeout_operation_conflict".to_string())
+            };
+        }
+        if !inner.sessions.values().any(|entry| {
+            entry.project() == Some(self.project.as_str())
+                && entry.lifecycle() == SessionLifecycle::Closed
+        }) || inner.sessions.values().any(|entry| {
+            entry.project() == Some(self.project.as_str())
+                && entry.lifecycle() == SessionLifecycle::Active
+        }) {
+            return Err("native_closeout_sessions_not_closed".to_string());
+        }
+        let database = inner
+            .persistence
+            .as_ref()
+            .ok_or_else(|| "durable_closeout_requires_database".to_string())?
+            .database
+            .clone();
+        // The transient fence is already active. A failed or indeterminate
+        // SQLite commit cannot open a Session admission gap.
+        database
+            .reserve_managed_closeout(&self.project, operation_id)
+            .map_err(|_| "durable_closeout_persistence_uncertain".to_string())?;
+        inner
+            .durable_closeout_projects
+            .insert(self.project.clone(), operation_id.to_string());
+        Ok(())
+    }
+}
+
 impl Drop for SessionProjectUnregisterGuard {
     fn drop(&mut self) {
         let mut inner = self

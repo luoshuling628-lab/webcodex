@@ -53,6 +53,59 @@ fn session_tool_contract(tool_name: &str) -> SessionToolContract {
 }
 
 #[test]
+fn native_closeout_held_session_guard_upgrades_durably_without_admission_gap() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("upgrade.json");
+    let store = persistent_store(ledger.clone());
+    let project = "agent:runner:managed-child";
+    let session = store.start_session_with_guards(
+        Some(project.into()),
+        Some("closed session".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    store.close_session(&session.session_id).unwrap();
+    store.flush_persistence();
+    let guard = store.begin_managed_worktree_cleanup_fence(project).unwrap();
+    assert_eq!(guard.persist_managed_closeout("operation-1"), Ok(()));
+    assert_eq!(guard.persist_managed_closeout("operation-1"), Ok(()));
+    assert_eq!(
+        guard.persist_managed_closeout("operation-2").unwrap_err(),
+        "durable_closeout_operation_conflict"
+    );
+    drop(guard);
+    assert_eq!(
+        store.durable_managed_worktree_closeout(project),
+        Some("operation-1".into())
+    );
+    assert!(store
+        .start_session_with_options(crate::SessionCreateOptions::new(
+            Some(project.into()),
+            Some("blocked".into()),
+            SessionMode::ReadOnly,
+            SessionGuards::default()
+        ))
+        .is_err());
+    drop(store);
+    let reopened = persistent_store(ledger);
+    assert_eq!(
+        reopened.durable_managed_worktree_closeout(project),
+        Some("operation-1".into())
+    );
+    assert!(reopened
+        .begin_managed_worktree_cleanup_fence(project)
+        .is_err());
+    assert!(reopened
+        .start_session_with_options(crate::SessionCreateOptions::new(
+            Some(project.into()),
+            Some("blocked on restart".into()),
+            SessionMode::ReadOnly,
+            SessionGuards::default()
+        ))
+        .is_err());
+}
+
+#[test]
 fn native_closeout_durable_reservation_survives_restart_and_blocks_new_sessions() {
     let temp = tempfile::tempdir().unwrap();
     let ledger = temp.path().join("managed-closeout.json");
