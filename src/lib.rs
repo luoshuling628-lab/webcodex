@@ -406,6 +406,27 @@ explicitly allow remote shared-key auth."
             tool_runtime_builder.with_activity_recorder(Arc::new(activity_store));
     }
     let tool_runtime = Arc::new(tool_runtime_builder);
+    // Reconcile the read-only discovery surface before accepting requests.
+    // Never synthesize an AuthContext or dispatch destructive Runner operations
+    // during bootstrap. Missing exact binding is a visible blocked state,
+    // not an empty recovery queue, and the SQLite Session fences stay held.
+    match tool_runtime
+        .sessions
+        .pending_managed_worktree_recovery_bindings()
+    {
+        Ok(pending) if !pending.is_empty() => tracing::warn!(
+            pending_native_closeouts = pending.len(),
+            "Native managed-worktree recovery requires trusted Owner admission"
+        ),
+        Ok(_) => tracing::info!(
+            pending_native_closeouts = 0,
+            "Native managed-worktree recovery inventory checked"
+        ),
+        Err(reason) => tracing::error!(
+            error_code = reason.as_str(),
+            "Native managed-worktree recovery inventory BLOCKED; durable leases remain enforced"
+        ),
+    }
     tracing::info!(
         project_scoped = project_auth.is_configured(),
         "Adaptive Runtime enabled"
