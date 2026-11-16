@@ -217,6 +217,95 @@ async fn register_with_instance(
         .unwrap()
 }
 
+#[tokio::test]
+async fn native_closeout_dispatch_pins_exact_runner_instance_and_capability() {
+    let registry = RunnerRegistry::default();
+    let mut caps = async_job_capabilities();
+    caps.native_managed_closeout = true;
+    register_instance_with_capabilities(&registry, "runner-closeout", "instance-1", caps.clone())
+        .await
+        .unwrap();
+
+    let rejected = registry
+        .enqueue_native_closeout_for_instance(
+            "runner-closeout".to_string(),
+            "{}".to_string(),
+            "server-native-owner".to_string(),
+            "instance-stale",
+        )
+        .await;
+    assert_eq!(
+        rejected.unwrap_err(),
+        "native_closeout_runner_instance_conflict"
+    );
+    assert_structured_delete_runner_idle(&registry, "runner-closeout").await;
+
+    let unfenced = registry
+        .enqueue_project_op(
+            "runner-closeout".to_string(),
+            "native_managed_closeout",
+            "{}".to_string(),
+            "ordinary-project-tool".to_string(),
+        )
+        .await;
+    assert!(
+        unfenced.is_err(),
+        "ordinary project tools must never enqueue deletion"
+    );
+
+    let accepted = registry
+        .enqueue_native_closeout_for_instance(
+            "runner-closeout".to_string(),
+            "{}".to_string(),
+            "server-native-owner".to_string(),
+            "instance-1",
+        )
+        .await;
+    assert!(
+        accepted.is_ok(),
+        "exact live Runner instance must be accepted"
+    );
+    let (request_id, _receiver) = accepted.unwrap();
+    {
+        let inner = registry.inner.lock().await;
+        let pending = inner.pending_by_id.get(&request_id).unwrap();
+        assert!(matches!(
+            &pending.dispatch_fence,
+            crate::dispatch_fence::PendingDispatchFence::NativeCloseout { runner_instance_id }
+                if runner_instance_id == "instance-1"
+        ));
+    }
+
+    // A new Runner incarnation cannot inherit the previous instance's
+    // pending closeout authorization, even with identical project identity.
+    register_instance_with_capabilities(&registry, "runner-closeout", "instance-2", caps)
+        .await
+        .unwrap();
+    let polled = registry
+        .poll(RunnerPollRequest {
+            client_id: "runner-closeout".to_string(),
+            runner_instance_id: "instance-2".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        polled.is_none(),
+        "replacement Runner must not receive stale closeout"
+    );
+    let stale = registry
+        .enqueue_native_closeout_for_instance(
+            "runner-closeout".to_string(),
+            "{}".to_string(),
+            "server-native-owner".to_string(),
+            "instance-1",
+        )
+        .await;
+    assert_eq!(
+        stale.unwrap_err(),
+        "native_closeout_runner_instance_conflict"
+    );
+}
+
 #[test]
 fn runner_owner_access_projection_enforces_owner_boundary() {
     use crate::access_control::assert_runner_owner;

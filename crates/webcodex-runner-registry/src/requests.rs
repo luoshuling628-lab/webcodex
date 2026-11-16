@@ -2438,6 +2438,41 @@ impl RunnerRegistry {
         payload: String,
         requested_by: String,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        self.enqueue_project_op_checked(client_id, kind, payload, requested_by, None)
+            .await
+    }
+
+    /// Pin native closeout dispatch to the exact Runner instance observed by
+    /// the Server's protected admission. Recheck while holding the Registry
+    /// lock immediately before queue insertion.
+    pub async fn enqueue_native_closeout_for_instance(
+        &self,
+        client_id: String,
+        payload: String,
+        requested_by: String,
+        expected_runner_instance_id: &str,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        if expected_runner_instance_id.is_empty() {
+            return Err("native_closeout_runner_instance_missing".to_string());
+        }
+        self.enqueue_project_op_checked(
+            client_id,
+            "native_managed_closeout",
+            payload,
+            requested_by,
+            Some(expected_runner_instance_id),
+        )
+        .await
+    }
+
+    async fn enqueue_project_op_checked(
+        &self,
+        client_id: String,
+        kind: &str,
+        payload: String,
+        requested_by: String,
+        expected_runner_instance_id: Option<&str>,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
         validate_id(&client_id, "client_id")?;
         if !matches!(
             kind,
@@ -2481,6 +2516,15 @@ impl RunnerRegistry {
             }),
         )?;
         let mut inner = self.inner.lock().await;
+        if let Some(expected_instance) = expected_runner_instance_id {
+            let runner = inner
+                .runners
+                .get(&client_id)
+                .ok_or_else(|| format!("unknown shell client: {client_id}"))?;
+            if runner.runner_instance_id != expected_instance {
+                return Err("native_closeout_runner_instance_conflict".to_string());
+            }
+        }
         if let Some(required_feature) = required_feature {
             let runner = inner
                 .runners
@@ -2493,7 +2537,13 @@ impl RunnerRegistry {
                 ));
             }
         }
-        enqueue_pending_request_locked(
+        let dispatch_fence =
+            expected_runner_instance_id.map_or(PendingDispatchFence::Unfenced, |id| {
+                PendingDispatchFence::NativeCloseout {
+                    runner_instance_id: id.to_string(),
+                }
+            });
+        enqueue_pending_request_with_fence_locked(
             self.telemetry.as_ref(),
             &mut inner,
             &client_id,
@@ -2501,6 +2551,7 @@ impl RunnerRegistry {
             request,
             Some(tx),
             None,
+            dispatch_fence,
         )?;
         notify_runner_locked(&inner, &client_id);
         Ok((request_id, rx))
