@@ -478,6 +478,56 @@ mod tests {
         .unwrap();
         assert_eq!(done.phase, CloseoutPhase::Unregistered);
         assert_eq!(read_verified_terminal(&registry, &candidate).unwrap(), done);
+
+        // Crash fault injection: Git already removed the Worktree but the
+        // Runner died before unregistering the exact Project. Persist an
+        // authentic intermediate journal plus its original registration,
+        // then restart the executor from disk. A read-only receipt must NOT
+        // release the durable Session lease at this intermediate phase.
+        let receipt_path = ledger_path(&registry, &candidate);
+        let terminal_bytes = fs::read(&receipt_path).unwrap();
+        let mut crashed = done.clone();
+        crashed.phase = CloseoutPhase::GitRemoved;
+        fs::write(&receipt_path, serde_json::to_vec(&crashed).unwrap()).unwrap();
+        fs::write(registry.join("fixture-child.toml"), &managed).unwrap();
+        assert_eq!(
+            read_verified_terminal(&registry, &candidate).unwrap_err(),
+            "native_closeout_terminal_not_proven"
+        );
+        let resumed = super::super::execute_native_closeout_under_runner_fences(
+            &policy,
+            &registry,
+            &jobs,
+            &shells,
+            candidate.clone(),
+        )
+        .unwrap();
+        assert_eq!(resumed, done);
+        assert!(!registry.join("fixture-child.toml").exists());
+        assert!(!child.exists());
+        assert_eq!(read_verified_terminal(&registry, &candidate).unwrap(), done);
+
+        // Second crash point: deletion completed before the PREPARED journal
+        // advanced; exact immutable identity may resume without running Git
+        // removal a second time. No registration is fabricated.
+        fs::write(&receipt_path, serde_json::to_vec(&candidate).unwrap()).unwrap();
+        assert_eq!(
+            read_verified_terminal(&registry, &candidate).unwrap_err(),
+            "native_closeout_terminal_not_proven"
+        );
+        assert_eq!(
+            super::super::execute_native_closeout_under_runner_fences(
+                &policy,
+                &registry,
+                &jobs,
+                &shells,
+                candidate.clone()
+            )
+            .unwrap(),
+            done
+        );
+        assert_eq!(fs::read(&receipt_path).unwrap(), terminal_bytes);
+
         // An interrupted transaction or a recreated Project registration
         // must never be accepted as a completed recovery receipt.
         let receipt_path = ledger_path(&registry, &candidate);
