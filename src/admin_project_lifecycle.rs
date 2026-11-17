@@ -109,6 +109,15 @@ pub(crate) struct ServiceResponse {
     pub body: Value,
 }
 
+/// Separates user-admin recovery from the Server's own narrowly scoped
+/// post-crash receipt reconciliation. DurableOwner has no route/HTTP entry
+/// and cannot request a new delete, only verify a previously sealed intent.
+#[allow(dead_code)]
+enum NativeRecoveryAuthority<'a> {
+    Admin(&'a AuthContext),
+    DurableOwner,
+}
+
 struct ProjectUnregisterFence {
     registry: Arc<RunnerRegistry>,
     project: String,
@@ -574,13 +583,27 @@ impl AdminProjectLifecycleService {
     #[allow(dead_code)]
     async fn reconcile_native_closeout_after_restart(
         &self,
-        auth: &AuthContext,
+        authority: NativeRecoveryAuthority<'_>,
         project: &str,
         operation_id: &str,
     ) -> Result<ServiceResponse, ServiceResponse> {
-        if !admin_project_mutation_authorized(auth) {
-            return Err(api_error(403, "admin_authority_required"));
-        }
+        // The internal principal can only reconcile an existing durable
+        // operation after independently authenticated Runner terminal proof.
+        // Never expose DurableOwner through a user-controlled endpoint.
+        let access = match authority {
+            NativeRecoveryAuthority::Admin(auth) => {
+                if !admin_project_mutation_authorized(auth) {
+                    return Err(api_error(403, "admin_authority_required"));
+                }
+                crate::runner_http::runner_access_from_auth(Some(auth))
+            }
+            NativeRecoveryAuthority::DurableOwner => Some(webcodex_runner_registry::RunnerAccess {
+                global_visibility: true,
+                owner_bypass: true,
+                username: None,
+                group: None,
+            }),
+        };
         let (client_id, project_id) = parse_runtime_project(project)?;
         if uuid::Uuid::parse_str(operation_id).is_err() {
             return Err(api_error(409, "native_closeout_recovery_identity_invalid"));
@@ -615,7 +638,6 @@ impl AdminProjectLifecycleService {
         if uuid::Uuid::parse_str(&incarnation).is_err() {
             return Err(api_error(409, "native_closeout_binding_unverified"));
         }
-        let access = crate::runner_http::runner_access_from_auth(Some(auth));
         self.runtime
             .runner_registry
             .assert_runner_access(access.as_ref(), &client_id)
@@ -734,6 +756,23 @@ impl AdminProjectLifecycleService {
                 "source": "runner_verified_terminal_journal",
             }),
         })
+    }
+
+    /// Unattended Server maintenance only: this method cannot create a
+    /// closeout intent or dispatch deletion. The only release authority is
+    /// the exact durable SQLite binding PLUS the Runner's read-only terminal
+    /// verification, checked again at receipt and Registry CAS.
+    pub(crate) async fn reconcile_sealed_native_closeout(
+        &self,
+        project: &str,
+        operation_id: &str,
+    ) -> Result<ServiceResponse, ServiceResponse> {
+        self.reconcile_native_closeout_after_restart(
+            NativeRecoveryAuthority::DurableOwner,
+            project,
+            operation_id,
+        )
+        .await
     }
 
     /// Make the existing Native Owner fences reachable through the protected

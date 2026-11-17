@@ -432,6 +432,57 @@ explicitly allow remote shared-key auth."
         "Adaptive Runtime enabled"
     );
 
+    // Opt-in recovery of an already-completed, durably bound native closeout.
+    // A sealed SQLite intent is authority only for read-only Runner terminal
+    // observation and exact stale projection/lease reconciliation. This task
+    // can NEVER dispatch a new destructive closeout. Disabled by default
+    // pending fault-injection E2E, independent review, and release admission.
+    if std::env::var("WEBCODEX_NATIVE_CLOSEOUT_SEALED_RECOVERY_ENABLED").as_deref() == Ok("true") {
+        let recovery_runtime = tool_runtime.clone();
+        let recovery_service = admin_project_lifecycle::AdminProjectLifecycleService::new(
+            tool_runtime.clone(),
+            db.clone(),
+        );
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await; // Let Runners reconnect after Server bootstrap.
+            loop {
+                interval.tick().await;
+                let pending = match recovery_runtime
+                    .sessions
+                    .pending_managed_worktree_recovery_bindings()
+                {
+                    Ok(pending) => pending,
+                    Err(reason) => {
+                        tracing::error!(
+                            error_code = reason.as_str(),
+                            "Native closeout recovery scan BLOCKED; no lease released"
+                        );
+                        continue;
+                    }
+                };
+                // Bounded work per sweep, no concurrent recovery owners for
+                // one project, and errors leave exact durable leases in place.
+                for (project, operation_id, _) in pending.into_iter().take(8) {
+                    match recovery_service
+                        .reconcile_sealed_native_closeout(&project, &operation_id)
+                        .await
+                    {
+                        Ok(_) => tracing::info!(
+                            project = %project, operation_id = %operation_id,
+                            "Native closeout sealed terminal reconciled"
+                        ),
+                        Err(response) => tracing::warn!(
+                            project = %project, operation_id = %operation_id,
+                            status = response.status,
+                            "Native closeout recovery remains blocked"
+                        ),
+                    }
+                }
+            }
+        });
+    }
     // Custom QUIC Runner transport. Default disabled;
     // only starts when WEBCODEX_QUIC_ENABLED=true. Runs a separate quinn UDP
     // listener in parallel with the HTTP server. HTTP/WebSocket/polling and
