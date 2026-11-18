@@ -4,7 +4,8 @@ use super::lsp::{handle_lsp_operation, LspSupervisor};
 use super::transport::ResultSubmission;
 use super::validation::handle_validation_request;
 use super::{
-    handle_browser_operation, handle_computer_operation, handle_prepare_managed_worktree_operation,
+    handle_browser_operation, handle_computer_operation, handle_native_closeout_receipt_operation,
+    handle_native_managed_closeout_operation, handle_prepare_managed_worktree_operation,
     handle_project_lifecycle_operation, handle_project_operation,
     handle_resolve_or_register_project_operation, handle_runner_instruction_request,
     handle_runner_skill_request, run_ssh_shell_with_execution_state, CommandResult,
@@ -691,6 +692,29 @@ pub(crate) fn dispatch_request_with_outcome(
                         &client_id,
                         &operation,
                     )
+                }
+                RunnerProjectOperationKind::NativeManagedCloseoutReceipt => {
+                    // Read-only exact terminal observation. No filesystem
+                    // cleanup is performed on this path. Still requires the
+                    // dedicated capability and exact Runner instance fence.
+                    handle_native_closeout_receipt_operation(project_registry_dir, &operation)
+                }
+                RunnerProjectOperationKind::NativeManagedCloseout => {
+                    // No dispatchable deletion until a durable, independently
+                    // admitted Server↔Runner owner lease is shipped and verified.
+                    // The internal Runner executor is tested separately.
+                    const RELEASE_ADMITTED: bool = false;
+                    if !RELEASE_ADMITTED {
+                        invalid_command("native_closeout_release_not_admitted")
+                    } else {
+                        handle_native_managed_closeout_operation(
+                            policy,
+                            project_registry_dir,
+                            jobs,
+                            persistent_shells,
+                            &operation,
+                        )
+                    }
                 }
                 RunnerProjectOperationKind::LifecycleEnable
                 | RunnerProjectOperationKind::LifecycleDisable

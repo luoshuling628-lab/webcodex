@@ -22,6 +22,7 @@ mod catalog;
 mod created_paths;
 mod lifecycle;
 mod managed_worktree;
+mod native_closeout;
 mod registration;
 
 pub(crate) use catalog::load_runner_project_metadata;
@@ -35,6 +36,109 @@ pub(crate) use catalog::{parse_runner_project_toml, runner_project_summary};
 pub(crate) use lifecycle::{handle_project_lifecycle_operation, handle_project_operation};
 
 pub(crate) use managed_worktree::handle_prepare_managed_worktree_operation;
+
+/// Execute only after the Server owns its continuously held native Session
+/// and Job-start closeout fences. This Runner-side exclusion closes both
+/// local managed admission races; no public transport operation is exposed
+/// until the Server↔Runner lease and crash-reconciliation protocol is bound.
+#[allow(dead_code)]
+/// Dedicated native Runner transport effect. An ordinary project lifecycle
+/// tool never selects this operation; only the Server Native Closeout Owner
+/// may enqueue it while retaining its own durable Session/Job fences.
+#[allow(dead_code)]
+pub(crate) fn handle_native_managed_closeout_operation(
+    policy: &super::config::RunnerPolicy,
+    registry: &std::path::Path,
+    jobs: &super::job_manager::JobManager,
+    shells: &super::persistent_shell::PersistentShellManager,
+    operation: &webcodex_core::runner_operation::RunnerProjectOperation,
+) -> CommandResult {
+    let start = Instant::now();
+    if operation.kind
+        != webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseout
+        || operation.payload.len() > 8192
+    {
+        return project_error_cmd(start, "native_closeout_invalid_request");
+    }
+    let candidate: native_closeout::NativeCloseoutRecord =
+        match serde_json::from_str(&operation.payload) {
+            Ok(candidate) => candidate,
+            Err(_) => return project_error_cmd(start, "native_closeout_invalid_request"),
+        };
+    let project_id = candidate.project_id.clone();
+    match execute_native_closeout_under_runner_fences(policy, registry, jobs, shells, candidate) {
+        Ok(receipt) => crate::webcodex_runner::output::ok_cmd(
+            start,
+            serde_json::json!({
+                "operation": "native_managed_closeout",
+                "outcome": "native_closeout_completed",
+                "changed": true,
+                "agent_project_id": project_id,
+                "operation_id": receipt.operation_id,
+                "expected_revision": receipt.expected_revision,
+                "registration_incarnation": receipt.expected_incarnation,
+                "phase": receipt.phase,
+            }),
+        ),
+        Err(reason) => structured_project_error_cmd(
+            start,
+            reason,
+            true, // Treat any failure as potentially partially committed.
+            serde_json::json!({"operation": "native_managed_closeout"}),
+        ),
+    }
+}
+
+/// Recovery observation never invokes a Git removal, unregister, or journal
+/// phase transition. It only returns an exact already-committed terminal.
+#[allow(dead_code)]
+pub(crate) fn handle_native_closeout_receipt_operation(
+    registry: &std::path::Path,
+    operation: &webcodex_core::runner_operation::RunnerProjectOperation,
+) -> CommandResult {
+    let start = Instant::now();
+    if operation.kind
+        != webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseoutReceipt
+        || operation.payload.len() > 8192
+    {
+        return project_error_cmd(start, "native_closeout_invalid_request");
+    }
+    let expected: native_closeout::NativeCloseoutRecord =
+        match serde_json::from_str(&operation.payload) {
+            Ok(value) => value,
+            Err(_) => return project_error_cmd(start, "native_closeout_invalid_request"),
+        };
+    match native_closeout::read_verified_terminal(registry, &expected) {
+        Ok(receipt) => crate::webcodex_runner::output::ok_cmd(
+            start,
+            serde_json::json!({
+                "operation": "native_managed_closeout_receipt",
+                "outcome": "native_closeout_completed",
+                "changed": false,
+                "agent_project_id": receipt.project_id,
+                "operation_id": receipt.operation_id,
+                "expected_revision": receipt.expected_revision,
+                "registration_incarnation": receipt.expected_incarnation,
+                "phase": receipt.phase,
+            }),
+        ),
+        Err(reason) => project_error_cmd(start, reason),
+    }
+}
+
+pub(crate) fn execute_native_closeout_under_runner_fences(
+    policy: &super::config::RunnerPolicy,
+    registry: &std::path::Path,
+    jobs: &super::job_manager::JobManager,
+    shells: &super::persistent_shell::PersistentShellManager,
+    candidate: native_closeout::NativeCloseoutRecord,
+) -> Result<native_closeout::NativeCloseoutRecord, &'static str> {
+    jobs.with_quiescent_job_admission(|| {
+        shells.with_quiescent_shell_admission(|| {
+            native_closeout::execute_under_verified_owner(policy, registry, candidate)
+        })
+    })
+}
 
 #[cfg(test)]
 use registration::build_project_toml;
@@ -241,6 +345,132 @@ mod durability_tests {
         assert_eq!(
             managed_worktree_git_cli_path(Path::new(r"\\server\share\managed")),
             r"\\server\share\managed"
+        );
+    }
+
+    #[test]
+    fn native_managed_worktree_git_reclaim_gate_preserves_unique_data() {
+        use super::managed_worktree::managed_worktree_local_git_reclaim_gate;
+        use std::process::Command;
+
+        fn git(root: &Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git available in native Runner test");
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let child = temp.path().join("new-worktree");
+        std::fs::create_dir(&source).unwrap();
+        git(&source, &["init"]);
+        git(&source, &["config", "user.name", "Managed Fixture"]);
+        git(
+            &source,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        std::fs::write(source.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(source.join("tracked.txt"), "commit one\n").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "first"]);
+        std::fs::write(source.join("tracked.txt"), "commit two\n").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "second"]);
+        let sha = git(&source, &["rev-parse", "HEAD"]);
+        let child_cli = super::managed_worktree::managed_worktree_git_cli_path(&child);
+        git(
+            &source,
+            &["worktree", "add", "--detach", &child_cli, "HEAD"],
+        );
+        assert_eq!(
+            managed_worktree_local_git_reclaim_gate(&source, &child, &sha),
+            Ok(())
+        );
+        let source_project: RunnerProjectFile = serde_json::from_value(serde_json::json!({
+            "id":"fixture-source", "path": source.to_string_lossy()
+        }))
+        .unwrap();
+        let mut managed: RunnerProjectFile = serde_json::from_value(serde_json::json!({
+            "id":"fixture-child","path":child.to_string_lossy(),
+            "registration_source":"auto_registered", "managed_worktree":true,
+            "registration_incarnation":"11111111-1111-4111-8111-111111111111",
+            "managed_operation_id":"22222222-2222-4222-8222-222222222222",
+            "managed_source":source.to_string_lossy(),
+            "managed_source_project_id":"fixture-source",
+            "managed_source_root_fingerprint":project_root_fingerprint(&source),
+            "managed_base_sha":sha
+        }))
+        .unwrap();
+        assert_eq!(
+            super::managed_worktree::managed_worktree_reclaim_lineage_gate(
+                &managed,
+                &source_project
+            ),
+            Ok(())
+        );
+        managed.managed_source_project_id = Some("foreign-source".to_owned());
+        assert_eq!(
+            super::managed_worktree::managed_worktree_reclaim_lineage_gate(
+                &managed,
+                &source_project
+            ),
+            Err("managed_reclaim_source_project_mismatch")
+        );
+        managed.managed_source_project_id = Some("fixture-source".to_owned());
+        managed.managed_source_root_fingerprint = Some("wrong-fingerprint".to_owned());
+        assert_eq!(
+            super::managed_worktree::managed_worktree_reclaim_lineage_gate(
+                &managed,
+                &source_project
+            ),
+            Err("managed_reclaim_source_fingerprint_mismatch")
+        );
+        managed.managed_source_root_fingerprint = Some(project_root_fingerprint(&source));
+        managed.registration_incarnation = Some("not-a-uuid".to_owned());
+        assert_eq!(
+            super::managed_worktree::managed_worktree_reclaim_lineage_gate(
+                &managed,
+                &source_project
+            ),
+            Err("managed_reclaim_registration_identity_invalid")
+        );
+
+        assert_eq!(
+            managed_worktree_local_git_reclaim_gate(&source, &child, "not-a-sha"),
+            Err("managed_reclaim_invalid_expected_head")
+        );
+        std::fs::write(child.join("unique.txt"), "do not lose me").unwrap();
+        assert_eq!(
+            managed_worktree_local_git_reclaim_gate(&source, &child, &sha),
+            Err("managed_reclaim_unique_content")
+        );
+        std::fs::remove_file(child.join("unique.txt")).unwrap();
+        std::fs::write(child.join("ignored.txt"), "also unique").unwrap();
+        assert_eq!(
+            managed_worktree_local_git_reclaim_gate(&source, &child, &sha),
+            Err("managed_reclaim_ignored_content")
+        );
+        std::fs::remove_file(child.join("ignored.txt")).unwrap();
+        let git_dir = git(&child, &["rev-parse", "--absolute-git-dir"]);
+        std::fs::write(Path::new(&git_dir).join("locked"), "do not remove").unwrap();
+        assert_eq!(
+            managed_worktree_local_git_reclaim_gate(&source, &child, &sha),
+            Err("managed_reclaim_locked")
+        );
+        std::fs::remove_file(Path::new(&git_dir).join("locked")).unwrap();
+        git(&child, &["reset", "--hard", "HEAD~1"]);
+        assert_eq!(
+            managed_worktree_local_git_reclaim_gate(&source, &child, &sha),
+            Err("managed_reclaim_head_drift")
         );
     }
 

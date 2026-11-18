@@ -80,6 +80,15 @@ pub(super) const ADMIN_ROUTES: &[RouteSpec] = &[
         Other,
         AuthMiddleware,
     ),
+    route(
+        AdminProjectsNativeCloseoutAdmission,
+        Post,
+        "/api/admin/projects/native-closeout-admission",
+        BootstrapOnly,
+        Admin,
+        Other,
+        AuthMiddleware,
+    ),
 ];
 
 pub(super) const AUDIT_ROUTES: &[RouteSpec] = &[

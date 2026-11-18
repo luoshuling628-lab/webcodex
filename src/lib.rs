@@ -406,11 +406,83 @@ explicitly allow remote shared-key auth."
             tool_runtime_builder.with_activity_recorder(Arc::new(activity_store));
     }
     let tool_runtime = Arc::new(tool_runtime_builder);
+    // Reconcile the read-only discovery surface before accepting requests.
+    // Never synthesize an AuthContext or dispatch destructive Runner operations
+    // during bootstrap. Missing exact binding is a visible blocked state,
+    // not an empty recovery queue, and the SQLite Session fences stay held.
+    match tool_runtime
+        .sessions
+        .pending_managed_worktree_recovery_bindings()
+    {
+        Ok(pending) if !pending.is_empty() => tracing::warn!(
+            pending_native_closeouts = pending.len(),
+            "Native managed-worktree recovery requires trusted Owner admission"
+        ),
+        Ok(_) => tracing::info!(
+            pending_native_closeouts = 0,
+            "Native managed-worktree recovery inventory checked"
+        ),
+        Err(reason) => tracing::error!(
+            error_code = reason.as_str(),
+            "Native managed-worktree recovery inventory BLOCKED; durable leases remain enforced"
+        ),
+    }
     tracing::info!(
         project_scoped = project_auth.is_configured(),
         "Adaptive Runtime enabled"
     );
 
+    // Opt-in recovery of an already-completed, durably bound native closeout.
+    // A sealed SQLite intent is authority only for read-only Runner terminal
+    // observation and exact stale projection/lease reconciliation. This task
+    // can NEVER dispatch a new destructive closeout. Disabled by default
+    // pending fault-injection E2E, independent review, and release admission.
+    if std::env::var("WEBCODEX_NATIVE_CLOSEOUT_SEALED_RECOVERY_ENABLED").as_deref() == Ok("true") {
+        let recovery_runtime = tool_runtime.clone();
+        let recovery_service = admin_project_lifecycle::AdminProjectLifecycleService::new(
+            tool_runtime.clone(),
+            db.clone(),
+        );
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await; // Let Runners reconnect after Server bootstrap.
+            loop {
+                interval.tick().await;
+                let pending = match recovery_runtime
+                    .sessions
+                    .pending_managed_worktree_recovery_bindings()
+                {
+                    Ok(pending) => pending,
+                    Err(reason) => {
+                        tracing::error!(
+                            error_code = reason.as_str(),
+                            "Native closeout recovery scan BLOCKED; no lease released"
+                        );
+                        continue;
+                    }
+                };
+                // Bounded work per sweep, no concurrent recovery owners for
+                // one project, and errors leave exact durable leases in place.
+                for (project, operation_id, _) in pending.into_iter().take(8) {
+                    match recovery_service
+                        .reconcile_sealed_native_closeout(&project, &operation_id)
+                        .await
+                    {
+                        Ok(_) => tracing::info!(
+                            project = %project, operation_id = %operation_id,
+                            "Native closeout sealed terminal reconciled"
+                        ),
+                        Err(response) => tracing::warn!(
+                            project = %project, operation_id = %operation_id,
+                            status = response.status,
+                            "Native closeout recovery remains blocked"
+                        ),
+                    }
+                }
+            }
+        });
+    }
     // Custom QUIC Runner transport. Default disabled;
     // only starts when WEBCODEX_QUIC_ENABLED=true. Runs a separate quinn UDP
     // listener in parallel with the HTTP server. HTTP/WebSocket/polling and

@@ -871,6 +871,14 @@ runner_capabilities! {
         #[serde(default, skip_serializing_if = "is_false")]
         pub managed_worktree: bool = false;
     }
+    /// Native Server-owned managed closeout execution. This requires a
+    /// continuously held Server Session/Job fence plus Runner-local Job and
+    /// persistent-shell admission fences. Never infer from managed bootstrap.
+    NativeManagedCloseout => RUNNER_CAPABILITY_NATIVE_MANAGED_CLOSEOUT("native_managed_closeout"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub native_managed_closeout: bool = false;
+    }
     /// Runner-global Skill catalog observation, exact resolution, and source-pinned read.
     /// Configured and managed sources share this cross-process runtime capability.
     SkillRuntime => RUNNER_CAPABILITY_SKILL_RUNTIME("skill_runtime"),
@@ -3017,6 +3025,7 @@ mod envelope_tests {
                 project_settings_update: false,
                 project_path_registration: false,
                 managed_worktree: false,
+                native_managed_closeout: false,
                 skill_runtime: false,
                 skill_resource_execution: false,
                 skill_management: false,

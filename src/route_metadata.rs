@@ -127,6 +127,7 @@ pub(crate) enum RouteId {
     AdminProjectsEnable,
     AdminProjectsDisable,
     AdminProjectsUnregister,
+    AdminProjectsNativeCloseoutAdmission,
     AdminProjectsUpdateAllowPatch,
     ToolsList,
     ToolsCall,

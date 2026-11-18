@@ -343,6 +343,7 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             project_settings_update: false,
             project_path_registration: false,
             managed_worktree: false,
+            native_managed_closeout: false,
             // Runner-local Skill runtime and management are implemented by the
             // running binary and are never inferred from project/file capabilities.
             skill_runtime: false,

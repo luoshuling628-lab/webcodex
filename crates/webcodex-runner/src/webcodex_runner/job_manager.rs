@@ -232,6 +232,31 @@ impl JobManager {
         self.max_concurrent.load(Ordering::Relaxed)
     }
 
+    /// Synchronous native closeout exclusion. Hold the exact Job admission
+    /// lock through the caller's effect, rather than observing an idle count
+    /// and releasing it before a new Job can be admitted. This conservative
+    /// Runner-wide gate rejects all unresolved jobs, detached jobs, queued
+    /// starts and workers. It does NOT fence persistent shells, the Server
+    /// SessionStore, or external processes and is not itself a delete permit.
+    #[allow(dead_code)]
+    pub(crate) fn with_quiescent_job_admission<T>(
+        &self,
+        execute: impl FnOnce() -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        let _lifecycle = lock_unpoison(&self.lifecycle);
+        if self.shutting_down.load(Ordering::SeqCst)
+            || !lock_unpoison(&self.queued).is_empty()
+            || !lock_unpoison(&self.detached_jobs).is_empty()
+            || self.workers.active() != 0
+            || lock_unpoison(&self.jobs)
+                .values()
+                .any(|job| lifecycle::runner_job_is_active(&job.snapshot.status))
+        {
+            return Err("native_closeout_runner_jobs_not_terminal");
+        }
+        execute()
+    }
+
     pub(crate) fn commit_concurrency_limit(&self, limit: usize) {
         let _lifecycle = lock_unpoison(&self.lifecycle);
         self.max_concurrent.store(limit, Ordering::Relaxed);
@@ -387,6 +412,63 @@ mod ssh;
 #[cfg(test)]
 #[path = "job_manager_tests.rs"]
 pub(crate) mod job_manager_tests;
+
+#[cfg(test)]
+mod native_closeout_job_fence_tests {
+    use super::*;
+
+    #[test]
+    fn holds_admission_lock_and_blocks_unresolved_jobs_or_workers() {
+        let manager = JobManager::new(1);
+        assert_eq!(
+            manager.with_quiescent_job_admission(|| {
+                assert!(manager.lifecycle.try_lock().is_err());
+                Ok(17)
+            }),
+            Ok(17)
+        );
+
+        lock_unpoison(&manager.jobs).insert(
+            "job-1".to_owned(),
+            RunningJob {
+                client_id: "runner".to_owned(),
+                runner_instance_id: "instance".to_owned(),
+                snapshot: test_job_snapshot("job-1"),
+                child: None,
+                input: None,
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                slot_reserved: false,
+            },
+        );
+        let mut executed = false;
+        assert_eq!(
+            manager.with_quiescent_job_admission(|| {
+                executed = true;
+                Ok(())
+            }),
+            Err("native_closeout_runner_jobs_not_terminal")
+        );
+        assert!(!executed);
+
+        lock_unpoison(&manager.jobs)
+            .get_mut("job-1")
+            .unwrap()
+            .snapshot
+            .status = "completed".to_owned();
+        let worker = manager.workers.enter();
+        assert_eq!(
+            manager.with_quiescent_job_admission(|| Ok(())),
+            Err("native_closeout_runner_jobs_not_terminal")
+        );
+        drop(worker);
+        assert_eq!(manager.with_quiescent_job_admission(|| Ok(19)), Ok(19));
+        manager.shutting_down.store(true, Ordering::SeqCst);
+        assert_eq!(
+            manager.with_quiescent_job_admission(|| Ok(())),
+            Err("native_closeout_runner_jobs_not_terminal")
+        );
+    }
+}
 
 #[cfg(test)]
 mod utf8_truncation_tests {

@@ -217,6 +217,193 @@ async fn register_with_instance(
         .unwrap()
 }
 
+#[tokio::test]
+async fn native_closeout_dispatch_pins_exact_runner_instance_and_capability() {
+    let registry = RunnerRegistry::default();
+    let mut caps = async_job_capabilities();
+    caps.native_managed_closeout = true;
+    register_instance_with_capabilities(&registry, "runner-closeout", "instance-1", caps.clone())
+        .await
+        .unwrap();
+
+    let rejected = registry
+        .enqueue_native_closeout_for_instance(
+            "runner-closeout".to_string(),
+            "{}".to_string(),
+            "server-native-owner".to_string(),
+            "instance-stale",
+        )
+        .await;
+    assert_eq!(
+        rejected.unwrap_err(),
+        "native_closeout_runner_instance_conflict"
+    );
+    assert_structured_delete_runner_idle(&registry, "runner-closeout").await;
+
+    let unfenced = registry
+        .enqueue_project_op(
+            "runner-closeout".to_string(),
+            "native_managed_closeout",
+            "{}".to_string(),
+            "ordinary-project-tool".to_string(),
+        )
+        .await;
+    assert!(
+        unfenced.is_err(),
+        "ordinary project tools must never enqueue deletion"
+    );
+
+    assert!(
+        registry
+            .enqueue_project_op(
+                "runner-closeout".to_string(),
+                "native_managed_closeout_receipt",
+                "{}".to_string(),
+                "unfenced-observer".to_string(),
+            )
+            .await
+            .is_err(),
+        "receipt must also require exact instance fence"
+    );
+    let (receipt_id, _receipt_response) = registry
+        .enqueue_native_closeout_receipt_for_instance(
+            "runner-closeout".to_string(),
+            "{}".to_string(),
+            "server-native-owner".to_string(),
+            "instance-1",
+        )
+        .await
+        .expect("read-only receipt lookup admitted for exact instance");
+    {
+        let inner = registry.inner.lock().await;
+        let pending = inner.pending_by_id.get(&receipt_id).unwrap();
+        assert!(matches!(
+            &pending.dispatch_fence,
+            crate::dispatch_fence::PendingDispatchFence::NativeCloseout { runner_instance_id }
+                if runner_instance_id == "instance-1"
+        ));
+    }
+
+    let accepted = registry
+        .enqueue_native_closeout_for_instance(
+            "runner-closeout".to_string(),
+            "{}".to_string(),
+            "server-native-owner".to_string(),
+            "instance-1",
+        )
+        .await;
+    assert!(
+        accepted.is_ok(),
+        "exact live Runner instance must be accepted"
+    );
+    let (request_id, _receiver) = accepted.unwrap();
+    {
+        let inner = registry.inner.lock().await;
+        let pending = inner.pending_by_id.get(&request_id).unwrap();
+        assert!(matches!(
+            &pending.dispatch_fence,
+            crate::dispatch_fence::PendingDispatchFence::NativeCloseout { runner_instance_id }
+                if runner_instance_id == "instance-1"
+        ));
+    }
+
+    // A new Runner incarnation cannot inherit the previous instance's
+    // pending closeout authorization, even with identical project identity.
+    register_instance_with_capabilities(&registry, "runner-closeout", "instance-2", caps)
+        .await
+        .unwrap();
+    let polled = registry
+        .poll(RunnerPollRequest {
+            client_id: "runner-closeout".to_string(),
+            runner_instance_id: "instance-2".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        polled.is_none(),
+        "replacement Runner must not receive stale closeout"
+    );
+    let stale = registry
+        .enqueue_native_closeout_for_instance(
+            "runner-closeout".to_string(),
+            "{}".to_string(),
+            "server-native-owner".to_string(),
+            "instance-1",
+        )
+        .await;
+    assert_eq!(
+        stale.unwrap_err(),
+        "native_closeout_runner_instance_conflict"
+    );
+}
+
+#[tokio::test]
+async fn native_closeout_projection_cas_rejects_new_incarnation_and_is_idempotent() {
+    let registry = RunnerRegistry::default();
+    register_with_instance(&registry, "runner-cas", "instance-1").await;
+    let mut project = project_summary("managed-child", "/tmp/managed-child");
+    project.registration_incarnation = Some("11111111-1111-4111-8111-111111111111".to_string());
+    registry
+        .upsert_runner_project("runner-cas", project)
+        .await
+        .unwrap();
+    assert_eq!(
+        registry
+            .reconcile_native_closeout_project_for_instance(
+                "runner-cas",
+                "instance-1",
+                "managed-child",
+                "22222222-2222-4222-8222-222222222222"
+            )
+            .await
+            .unwrap_err(),
+        "native_closeout_projection_cas_conflict"
+    );
+    assert!(registry
+        .get_runner_view("runner-cas")
+        .await
+        .unwrap()
+        .projects
+        .iter()
+        .any(|p| p.id == "managed-child"));
+    assert_eq!(
+        registry
+            .reconcile_native_closeout_project_for_instance(
+                "runner-cas",
+                "instance-1",
+                "managed-child",
+                "11111111-1111-4111-8111-111111111111"
+            )
+            .await
+            .unwrap(),
+        true
+    );
+    assert_eq!(
+        registry
+            .reconcile_native_closeout_project_for_instance(
+                "runner-cas",
+                "instance-1",
+                "managed-child",
+                "11111111-1111-4111-8111-111111111111"
+            )
+            .await
+            .unwrap(),
+        false
+    );
+    assert_eq!(
+        registry
+            .reconcile_native_closeout_project_for_instance(
+                "runner-cas",
+                "replaced-instance",
+                "managed-child",
+                "11111111-1111-4111-8111-111111111111"
+            )
+            .await
+            .unwrap_err(),
+        "native_closeout_runner_instance_conflict"
+    );
+}
+
 #[test]
 fn runner_owner_access_projection_enforces_owner_boundary() {
     use crate::access_control::assert_runner_owner;

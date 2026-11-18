@@ -312,6 +312,9 @@ pub(crate) fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabili
     // advertise a capability that the binary does not implement.
     capabilities.set(RunnerCapabilityId::ProjectPathRegistration, true);
     capabilities.set(RunnerCapabilityId::ManagedWorktree, true);
+    // Transport code exists, but a cross-process durable Server owner lease
+    // has not yet been independently validated. Do not advertise delete.
+    capabilities.set(RunnerCapabilityId::NativeManagedCloseout, false);
     // Configured live roots and managed active Skills share one Runner-local runtime
     // boundary; managed lifecycle authority remains independently advertised.
     capabilities.set(RunnerCapabilityId::SkillRuntime, true);
