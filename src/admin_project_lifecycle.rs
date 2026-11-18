@@ -230,6 +230,8 @@ fn native_closeout_bound_runner_payload(
         || !verified_remote_ref.starts_with("refs/heads/")
         || verified_remote_ref.len() == "refs/heads/".len()
         || verified_remote_ref.contains("..")
+        || verified_remote_ref.ends_with('/')
+        || verified_remote_ref.ends_with(".lock")
         || verified_remote_ref
             .chars()
             .any(|c| c.is_control() || c.is_whitespace() || c == ':' || c == '\\')
@@ -2055,6 +2057,18 @@ mod tests {
         assert!(make(&child, &source, "", "refs/heads/main").is_err());
         assert!(make(&child, &source, "https://example.invalid", "HEAD").is_err());
         assert!(make(&child, &source, "https://example.invalid", "refs/heads/").is_err());
+        // Match Runner's exact recoverability gate *before* writing a durable
+        // Session lease; these invalid refs would otherwise strand cleanup.
+        for invalid_ref in [
+            "refs/heads/main/",
+            "refs/heads/main.lock",
+            "refs/heads/deploy/.lock",
+        ] {
+            assert!(
+                make(&child, &source, "https://example.invalid", invalid_ref).is_err(),
+                "Server must reject Runner-forbidden ref {invalid_ref}"
+            );
+        }
         assert!(make(
             &child,
             &source,
