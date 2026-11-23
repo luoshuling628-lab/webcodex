@@ -468,6 +468,26 @@ mod tests {
         );
         assert!(child.join("unique.txt").exists());
         fs::remove_file(child.join("unique.txt")).unwrap();
+
+        // Remote refs can disappear between admission and execution.
+        // Never physically remove the Worktree if remote recovery is lost.
+        git(&source, &["push", "origin", ":refs/heads/main"]);
+        assert_eq!(
+            super::super::execute_native_closeout_under_runner_fences(
+                &policy,
+                &registry,
+                &jobs,
+                &shells,
+                candidate.clone()
+            )
+            .unwrap_err(),
+            "managed_reclaim_remote_unreachable"
+        );
+        assert!(child.exists());
+        assert!(registry.join("fixture-child.toml").exists());
+        assert!(read_verified_terminal(&registry, &candidate).is_err());
+        git(&source, &["push", "origin", "main"]);
+
         let done = super::super::execute_native_closeout_under_runner_fences(
             &policy,
             &registry,
