@@ -310,6 +310,73 @@ fn native_closeout_owner_identity_ready(
         && project.git_head.is_some()
 }
 
+/// Native Session close event -> existing protected Owner *observation*.
+/// The caller must already have committed and flushed the Closed Session.
+/// This is NOT an execution issuer and can never persist a deletion intent:
+/// it does not invent admin authority or infer remote Git recovery bindings.
+fn native_closeout_wakeup_target<'a>(
+    auth: Option<&'a AuthContext>,
+    project: Option<&'a str>,
+) -> Option<(&'a AuthContext, String, String, &'a str)> {
+    let auth = auth.filter(|auth| admin_project_mutation_authorized(auth))?;
+    let project = project?;
+    let (client_id, project_id) = parse_runtime_project(project).ok()?;
+    Some((auth, client_id, project_id, project))
+}
+
+/// A real, durably closed Session may wake the existing Native Owner fence.
+/// Always drops the observation guards; no Runner delete operation or sealed
+/// intent is dispatched here. Missing privileges and inventory fail closed.
+pub(crate) async fn observe_native_closeout_closed_session(
+    runtime: &ToolRuntime,
+    auth: Option<&AuthContext>,
+    project: Option<&str>,
+) -> &'static str {
+    let Some((auth, client_id, project_id, target)) = native_closeout_wakeup_target(auth, project)
+    else {
+        return "native_closeout_wakeup_not_authorized";
+    };
+    let access = crate::runner_http::runner_access_from_auth(Some(auth));
+    let Some(client) = runtime
+        .runner_registry
+        .get_runner_semantic_view_for_auth(&client_id, access.as_ref())
+        .await
+    else {
+        return "native_closeout_wakeup_runner_unavailable";
+    };
+    if !client.view.connected
+        || client.view.status != "online"
+        || !client
+            .view
+            .project_inventory
+            .as_ref()
+            .is_some_and(|inventory| inventory.sync_state == "complete")
+    {
+        return "native_closeout_wakeup_inventory_unverified";
+    }
+    let Some(child) = client
+        .view
+        .projects
+        .iter()
+        .find(|entry| entry.id == project_id)
+    else {
+        return "native_closeout_wakeup_project_not_found";
+    };
+    let Some(revision) = child.revision.as_deref() else {
+        return "native_closeout_wakeup_revision_unverified";
+    };
+    if !native_closeout_owner_identity_ready(child, revision) {
+        return "native_closeout_wakeup_not_managed";
+    }
+    match begin_native_managed_closeout_fences(runtime, auth, target, revision, None).await {
+        Ok(guards) => {
+            drop(guards);
+            "native_closeout_wakeup_observed_no_delete"
+        }
+        Err(_) => "native_closeout_wakeup_owner_gate_blocked",
+    }
+}
+
 /// Acquire the existing Runner job-start fence and the stronger native
 /// Session closeout fence in that order. A successful return does NOT authorize
 /// unregister or Git deletion. Unlike ordinary Project unregister, the
@@ -1722,6 +1789,33 @@ mod tests {
     use webcodex_runner_registry::{JobStartContext, JobStartRequest};
 
     use crate::runner_protocol::{RunnerCapabilities, RunnerRegisterRequest};
+
+    #[test]
+    fn native_closeout_session_wakeup_never_invents_owner_authority() {
+        let ordinary = user_auth("ordinary");
+        assert!(
+            native_closeout_wakeup_target(Some(&ordinary), Some("agent:runner:managed"),).is_none()
+        );
+        let mut admin = user_auth("admin");
+        admin.scopes = vec![crate::auth::scopes::SCOPE_ADMIN.to_string()];
+        assert!(native_closeout_wakeup_target(None, Some("agent:runner:managed")).is_none());
+        assert!(native_closeout_wakeup_target(Some(&admin), None).is_none());
+        assert!(native_closeout_wakeup_target(Some(&admin), Some("ordinary-project")).is_none());
+        assert!(
+            native_closeout_wakeup_target(Some(&admin), Some("agent:runner:managed:extra"))
+                .is_none()
+        );
+        let (_, runner, project, exact) =
+            native_closeout_wakeup_target(Some(&admin), Some("agent:runner:managed"))
+                .expect("existing admin authority and exact project only");
+        assert_eq!(runner, "runner");
+        assert_eq!(project, "managed");
+        assert_eq!(exact, "agent:runner:managed");
+        admin.kind = AuthKind::AgentToken;
+        assert!(
+            native_closeout_wakeup_target(Some(&admin), Some("agent:runner:managed"),).is_none()
+        );
+    }
 
     #[test]
     fn native_managed_closeout_requires_exact_registered_clean_identity() {

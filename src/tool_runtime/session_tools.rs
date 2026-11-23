@@ -570,6 +570,30 @@ impl ToolRuntime {
                         }),
                     );
                 }
+                // This exact first-time Closed transition is now durable.
+                // Wake the existing protected Native Owner observation path,
+                // never a deletion route, and never manufacture admin access.
+                // The outcome cannot change the already committed Session close.
+                if !outcome.already_closed
+                    && outcome
+                        .summary
+                        .project
+                        .as_deref()
+                        .is_some_and(|project| project.starts_with("agent:"))
+                {
+                    let wakeup =
+                        crate::admin_project_lifecycle::observe_native_closeout_closed_session(
+                            self,
+                            auth,
+                            outcome.summary.project.as_deref(),
+                        )
+                        .await;
+                    tracing::info!(
+                        session_id = %outcome.summary.session_id,
+                        wakeup_outcome = wakeup,
+                        "Durable Session close Native Owner observation (no delete)"
+                    );
+                }
                 ToolResult::ok(json!({
                     "success": true,
                     "session_id": outcome.summary.session_id,
