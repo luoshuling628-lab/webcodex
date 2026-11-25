@@ -53,6 +53,82 @@ fn session_tool_contract(tool_name: &str) -> SessionToolContract {
 }
 
 #[test]
+fn native_closed_worktree_discovery_recovers_after_restart_and_never_infers_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("closed-discovery.json");
+    let eligible = "agent:runner:closed-managed";
+    let active_project = "agent:runner:still-active";
+    let first = persistent_store(ledger.clone());
+    let closed = first.start_session_with_guards(
+        Some(eligible.into()),
+        Some("closed".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    let active = first.start_session_with_guards(
+        Some(active_project.into()),
+        Some("active".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    let ordinary = first.start_session_with_guards(
+        Some("local:ordinary".into()),
+        Some("not managed".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    first.close_session(&closed.session_id).unwrap();
+    first.close_session(&ordinary.session_id).unwrap();
+    first.flush_persistence();
+    assert_eq!(
+        first.discover_closed_managed_worktree_candidates(),
+        vec![eligible.to_string()],
+    );
+    drop(first);
+
+    // A restart discovers the already durable close without any new event,
+    // authorization, callback invocation, or deletion intent.
+    let restarted = persistent_store(ledger);
+    assert_eq!(
+        restarted.discover_closed_managed_worktree_candidates(),
+        vec![eligible.to_string()],
+    );
+    assert!(restarted
+        .durable_managed_worktree_closeout(eligible)
+        .is_none());
+    let competing = restarted.start_session_with_guards(
+        Some(eligible.into()),
+        Some("new active".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    assert!(restarted
+        .discover_closed_managed_worktree_candidates()
+        .is_empty());
+    restarted.close_session(&competing.session_id).unwrap();
+    assert_eq!(
+        restarted.discover_closed_managed_worktree_candidates(),
+        vec![eligible.to_string()],
+    );
+    let guard = restarted
+        .begin_managed_worktree_cleanup_fence(eligible)
+        .unwrap();
+    assert!(restarted
+        .discover_closed_managed_worktree_candidates()
+        .is_empty());
+    drop(guard);
+    assert_eq!(
+        restarted.discover_closed_managed_worktree_candidates(),
+        vec![eligible.to_string()],
+    );
+    assert_eq!(
+        restarted.retained_project_session_counts(active_project),
+        (1, 0)
+    );
+    assert!(restarted.summary(&active.session_id, Some(5)).is_some());
+}
+
+#[test]
 fn native_closeout_atomic_descriptor_survives_restart_and_exact_release() {
     let temp = tempfile::tempdir().unwrap();
     let ledger = temp.path().join("native-bound-recovery.json");

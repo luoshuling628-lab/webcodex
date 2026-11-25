@@ -1376,6 +1376,46 @@ impl SessionStore {
         })
     }
 
+    /// Read-only cold-start candidate discovery for the existing Native
+    /// Closeout Owner. This is not execution authority: the Owner must still
+    /// verify the exact live Runner registration, all jobs/shells, Git remote
+    /// recoverability and its own durable deletion intent before mutation.
+    ///
+    /// Closed Session state is already persisted by SessionStore; deriving
+    /// candidates from that state makes a missed close notification retryable
+    /// after Server restart without storing a second, weaker work queue.
+    /// Retention may erase a candidate, so this is best-effort discovery,
+    /// never a proof of absence or a permit to infer project ownership.
+    pub fn discover_closed_managed_worktree_candidates(&self) -> Vec<String> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut states = std::collections::BTreeMap::<String, (bool, bool)>::new();
+        for record in inner.sessions.values() {
+            let Some(project) = record.project() else {
+                continue;
+            };
+            if !project.starts_with("agent:") {
+                continue;
+            }
+            let status = states.entry(project.to_owned()).or_default();
+            match record.lifecycle() {
+                SessionLifecycle::Closed => status.0 = true,
+                SessionLifecycle::Active => status.1 = true,
+            }
+        }
+        states
+            .into_iter()
+            .filter_map(|(project, (has_closed, has_active))| {
+                (has_closed
+                    && !has_active
+                    && !inner.unregistering_projects.contains(&project)
+                    && !inner.durable_closeout_projects.contains_key(&project))
+                .then_some(project)
+            })
+            .collect()
+    }
+
     /// Cross-authority metadata count. Never leaks Session ID or content.
     pub fn retained_project_session_counts(&self, project: &str) -> (usize, usize) {
         let inner = self.inner.lock().expect("session store mutex poisoned");
