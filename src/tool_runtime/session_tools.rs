@@ -581,13 +581,19 @@ impl ToolRuntime {
                         .as_deref()
                         .is_some_and(|project| project.starts_with("agent:"))
                 {
-                    let wakeup =
+                    // An unavailable Runner/Owner must never hold up a
+                    // committed Session close. Timeout cancels observation;
+                    // no mutation/lease is granted by this notification.
+                    let wakeup = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
                         crate::admin_project_lifecycle::observe_native_closeout_closed_session(
                             self,
                             auth,
                             outcome.summary.project.as_deref(),
-                        )
-                        .await;
+                        ),
+                    )
+                    .await
+                    .unwrap_or("native_closeout_wakeup_timeout_no_delete");
                     tracing::info!(
                         session_id = %outcome.summary.session_id,
                         wakeup_outcome = wakeup,

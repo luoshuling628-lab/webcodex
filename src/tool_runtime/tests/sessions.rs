@@ -694,6 +694,48 @@ async fn close_session_tool_active_to_closed_and_query_still_works() {
 }
 
 #[tokio::test]
+async fn durable_agent_session_close_wakeup_does_not_require_delete_admission() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "important data\\n", "fixture");
+    let runtime = test_runtime();
+    let project =
+        register_runner_project_at_path(&runtime, "native-wakeup-safe", "demo", tmp.path()).await;
+    let session = runtime.sessions.start_session(
+        Some(project),
+        Some("durable close is independent".to_string()),
+    );
+    let bootstrap = auth_context(None, true);
+    let closed = runtime
+        .dispatch_with_auth(
+            ToolCall::CloseSession {
+                session_id: session.session_id.clone(),
+            },
+            Some(&bootstrap),
+        )
+        .await;
+    assert!(closed.success, "{:?}", closed.error);
+    assert_eq!(closed.output["lifecycle"], "closed");
+    assert_eq!(closed.output["already_closed"], false);
+    assert!(tmp.path().join("README.md").exists());
+    assert_eq!(
+        runtime.sessions.lifecycle_state(&session.session_id),
+        Some(super::super::sessions::SessionLifecycle::Closed)
+    );
+    let replay = runtime
+        .dispatch_with_auth(
+            ToolCall::CloseSession {
+                session_id: session.session_id.clone(),
+            },
+            Some(&bootstrap),
+        )
+        .await;
+    assert!(replay.success, "{:?}", replay.error);
+    assert_eq!(replay.output["already_closed"], true);
+    assert!(tmp.path().join("README.md").exists());
+}
+
+#[tokio::test]
 async fn close_session_unknown_id_fails_without_create() {
     let runtime = test_runtime();
     let missing = "wc_sess_toolmissingclose01";
