@@ -591,7 +591,7 @@ mod tests {
             .unwrap(),
             done
         );
-        let mut conflict = candidate;
+        let mut conflict = candidate.clone();
         conflict.expected_head = "b".repeat(40);
         assert_eq!(
             read_verified_terminal(&registry, &conflict).unwrap_err(),
@@ -604,6 +604,47 @@ mod tests {
             .unwrap_err(),
             "native_closeout_idempotency_conflict"
         );
+
+        // Only this compiled test binary can opt into exporting an isolated
+        // attestation. No production Runner command, capability or gate changes.
+        if let Some(path) = std::env::var_os("WEBCODEX_NATIVE_CLOSEOUT_TEST_RECEIPT") {
+            let proof = serde_json::json!({
+                "phase": "unregistered",
+                "git_worktree_removed": !child.exists(),
+                "cas_unregistered": !registry.join("fixture-child.toml").exists(),
+                "durable_terminal_verified": read_verified_terminal(&registry, &candidate).is_ok(),
+                "remote_ref": "refs/heads/main",
+                "operation_id": done.operation_id,
+            });
+            fs::write(path, serde_json::to_vec(&proof).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn native_closeout_full_transaction_completes_in_separate_os_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = dir.path().join("subprocess-terminal.json");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("native_closeout_full_runner_transaction_is_durable_and_idempotent")
+            .arg("--nocapture")
+            .env("WEBCODEX_NATIVE_CLOSEOUT_TEST_RECEIPT", &receipt)
+            .output()
+            .expect("launch isolated native closeout test process");
+        assert!(
+            output.status.success(),
+            "independent closeout process failed: {}\\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipt).expect("subprocess receipt persisted"))
+                .unwrap();
+        assert_eq!(evidence["phase"], "unregistered");
+        assert_eq!(evidence["git_worktree_removed"], true);
+        assert_eq!(evidence["cas_unregistered"], true);
+        assert_eq!(evidence["durable_terminal_verified"], true);
+        assert_eq!(evidence["remote_ref"], "refs/heads/main");
+        assert!(uuid::Uuid::parse_str(evidence["operation_id"].as_str().unwrap()).is_ok());
     }
 
     #[test]
