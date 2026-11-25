@@ -22,7 +22,14 @@ def stop(process):
     if process is None or process.poll() is not None:
         return
     if os.name == "nt":
-        process.terminate()
+        # Runner can own child processes retaining its log file after a
+        # Windows terminate(). Kill only this isolated fixture process tree,
+        # never any production process or unrelated Runner.
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False, timeout=15,
+        )
     else:
         process.send_signal(__import__("signal").SIGINT)
     try:
@@ -64,11 +71,39 @@ class CloseoutFenceSmoke(Acceptance):
               "native closeout altered unique Project data")
         print("PASS: isolated Server/Runner closeout admission did not remove unique data")
 
+        # Exercise the real trusted Session close event over Server HTTP
+        # against an independently running Runner, not just admission.
+        def tool(name: str, params: dict) -> dict:
+            result = self.post("/api/tools/call",
+                               {"tool": name, "params": params}, self.bootstrap)
+            check(result.get("success") is True,
+                  f"{name} failed: {result}")
+            return result["output"]
+
+        started = tool("start_session", {
+            "project": self.project,
+            "title": "isolated-native-owner-wakeup",
+        })
+        session_id = started["session_id"]
+        closed = tool("close_session", {"session_id": session_id})
+        check(closed.get("lifecycle") == "closed"
+              and closed.get("already_closed") is False,
+              "first durable close did not complete")
+        replay = tool("close_session", {"session_id": session_id})
+        check(replay.get("already_closed") is True,
+              "idempotent close replay did not hold")
+        check(sentinel.read_text(encoding="utf-8") == "NEVER_DELETE_UNIQUE_CONTENT\n",
+              "Session close wakeup deleted unique Project content")
+        print("PASS: real Server Session close wakeup completed; idempotent; no delete")
+
         stop(self.server)
         self.server = None
         self.start_server()
         self.wait_ready(self.project, self.owner)
         check(sentinel.is_file(), "Server restart lost the unique file")
+        persisted = tool("read_session_summary", {"session_id": session_id})
+        check(persisted.get("lifecycle") == "closed",
+              "Server restart lost the durable closed Session")
         observed = self.post(endpoint, payload, self.bootstrap)
         check(observed.get("delete_authorized") is not True,
               "Server restart elevated read-only admission")
