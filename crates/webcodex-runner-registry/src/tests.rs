@@ -265,6 +265,41 @@ async fn native_closeout_dispatch_pins_exact_runner_instance_and_capability() {
             .is_err(),
         "receipt must also require exact instance fence"
     );
+    assert!(
+        registry
+            .enqueue_project_op(
+                "runner-closeout".into(),
+                "native_managed_closeout_recovery_probe",
+                "{}".into(),
+                "unfenced-observer".into()
+            )
+            .await
+            .is_err(),
+        "ordinary project tool cannot request native recovery probe"
+    );
+    assert_eq!(
+        registry
+            .enqueue_native_closeout_recovery_probe_for_instance(
+                "runner-closeout".into(),
+                "{}".into(),
+                "instance-stale"
+            )
+            .await
+            .unwrap_err(),
+        "native_closeout_runner_instance_conflict"
+    );
+    assert!(
+        registry
+            .enqueue_native_closeout_recovery_probe_for_instance(
+                "runner-closeout".into(),
+                "{}".into(),
+                "instance-1"
+            )
+            .await
+            .is_ok(),
+        "read-only probe accepted with exact live Runner instance"
+    );
+
     let (receipt_id, _receipt_response) = registry
         .enqueue_native_closeout_receipt_for_instance(
             "runner-closeout".to_string(),

@@ -426,6 +426,12 @@ mod tests {
         );
         fs::write(registry.join("fixture-child.toml"), &managed).unwrap();
         let parsed = super::super::catalog::parse_runner_project_toml(&managed).unwrap();
+        let inventory_child = super::super::catalog::runner_project_summary(&parsed, 1, true);
+        assert_eq!(
+            inventory_child.git_head.as_deref(),
+            Some(sha.as_str()),
+            "Runner inventory must use exact full SHA required by Server CAS"
+        );
         let candidate = NativeCloseoutRecord {
             operation_id: uuid::Uuid::new_v4().to_string(),
             project_id: "fixture-child".into(),
@@ -469,9 +475,66 @@ mod tests {
         assert!(child.join("unique.txt").exists());
         fs::remove_file(child.join("unique.txt")).unwrap();
 
+        // Read-only wire probe uses only the registered child and source:
+        // no caller-supplied path or remote branch is accepted.
+        let probe = webcodex_core::runner_operation::RunnerProjectOperation {
+            kind: webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseoutRecoveryProbe,
+            payload: serde_json::json!({
+                "project_id": candidate.project_id,
+                "expected_revision": candidate.expected_revision,
+                "expected_incarnation": candidate.expected_incarnation,
+                "expected_head": candidate.expected_head,
+                "expected_root_fingerprint": candidate.expected_root_fingerprint,
+            }).to_string(),
+        };
+        let before = fs::read(registry.join("fixture-child.toml")).unwrap();
+        let observed = super::super::handle_native_closeout_recovery_probe_operation(
+            &policy, &registry, &probe,
+        );
+        assert_eq!(observed.exit_code, Some(0), "{:?}", observed.stderr);
+        let proof: serde_json::Value =
+            serde_json::from_str(observed.stdout.as_deref().unwrap()).unwrap();
+        assert_eq!(proof["operation"], "native_managed_closeout_recovery_probe");
+        assert_eq!(proof["changed"], false);
+        assert_eq!(proof["verified_remote_ref"], "refs/heads/main");
+        assert_eq!(proof["verified_origin_url"], remote.to_str().unwrap());
+        assert!(child.exists());
+        assert_eq!(
+            fs::read(registry.join("fixture-child.toml")).unwrap(),
+            before
+        );
+
+        let mut altered: serde_json::Value = serde_json::from_str(&probe.payload).unwrap();
+        altered["expected_head"] = serde_json::json!("b".repeat(40));
+        let forged = webcodex_core::runner_operation::RunnerProjectOperation {
+            kind: probe.kind,
+            payload: altered.to_string(),
+        };
+        assert_ne!(
+            super::super::handle_native_closeout_recovery_probe_operation(
+                &policy, &registry, &forged
+            )
+            .exit_code,
+            Some(0),
+            "forged Git identity must not be accepted as recovery evidence"
+        );
+        assert!(child.exists());
+        assert_eq!(
+            fs::read(registry.join("fixture-child.toml")).unwrap(),
+            before
+        );
+
         // Remote refs can disappear between admission and execution.
         // Never physically remove the Worktree if remote recovery is lost.
         git(&source, &["push", "origin", ":refs/heads/main"]);
+        let revoked = super::super::handle_native_closeout_recovery_probe_operation(
+            &policy, &registry, &probe,
+        );
+        assert_ne!(
+            revoked.exit_code,
+            Some(0),
+            "stale remote recovery probe must fail closed"
+        );
         assert_eq!(
             super::super::execute_native_closeout_under_runner_fences(
                 &policy,

@@ -576,11 +576,7 @@ fn runner_project_summary_with_shutdown(
             &["rev-parse", "--abbrev-ref", "HEAD"],
             shutdown,
         );
-        let head = run_git_capture(
-            &resolved_path,
-            &["log", "-1", "--pretty=format:%h"],
-            shutdown,
-        );
+        let head = run_git_capture(&resolved_path, &["rev-parse", "--verify", "HEAD"], shutdown);
         let dirty = run_git_capture(&resolved_path, &["status", "--short"], shutdown)
             .map(|status| !status.trim().is_empty());
         (branch, head, dirty)

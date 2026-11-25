@@ -267,6 +267,39 @@ fn native_closeout_bound_runner_payload(
     }))
 }
 
+/// Validate a Registry-authenticated exact Runner instance's read-only Git
+/// recovery proof against the SAME atomic inventory used for Owner admission.
+/// This parser alone is not an authentication mechanism.
+fn native_closeout_recovery_probe_matches(
+    exit_code: Option<i32>,
+    evidence: &Value,
+    child: &RunnerProjectSummary,
+    source: &RunnerProjectSummary,
+    expected_revision: &str,
+) -> Result<(String, String), &'static str> {
+    let field = |name| evidence.get(name).and_then(Value::as_str);
+    if exit_code != Some(0)
+        || evidence.get("error_code").is_some()
+        || field("operation") != Some("native_managed_closeout_recovery_probe")
+        || evidence.get("changed").and_then(Value::as_bool) != Some(false)
+        || field("project_id") != Some(child.id.as_str())
+        || field("expected_revision") != Some(expected_revision)
+        || field("expected_incarnation") != child.registration_incarnation.as_deref()
+        || field("expected_head") != child.git_head.as_deref()
+        || field("expected_root_fingerprint") != child.root_fingerprint.as_deref()
+        || field("source_root_fingerprint") != source.root_fingerprint.as_deref()
+    {
+        return Err("native_closeout_recovery_probe_identity_conflict");
+    }
+    let origin = field("verified_origin_url")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("native_closeout_recovery_probe_invalid_origin")?;
+    let reference = field("verified_remote_ref")
+        .filter(|value| value.starts_with("refs/heads/"))
+        .ok_or("native_closeout_recovery_probe_invalid_ref")?;
+    Ok((origin.to_owned(), reference.to_owned()))
+}
+
 /// Read-only recovered terminal must not masquerade as a fresh mutation
 /// receipt. Identity matching is necessary but the trusted exact-instance
 /// Registry response is also required before releasing a durable lease.
@@ -478,8 +511,8 @@ struct VerifiedNativeCloseoutIntent {
     project: String,
     expected_revision: String,
     operation_id: String,
-    verified_origin_url: String,
-    verified_remote_ref: String,
+    // Recovery binding is generated through exact-instance Runner probe,
+    // never supplied by a Session, UI, or caller.
 }
 
 #[derive(Clone)]
@@ -551,13 +584,58 @@ impl AdminProjectLifecycleService {
             .iter()
             .find(|entry| entry.id == *source_id)
             .ok_or_else(|| api_error(409, "native_closeout_source_unverified"))?;
+        let instance_id = client.view.runner_instance_id.clone();
+        let probe_request = json!({
+            "project_id": project_id,
+            "expected_revision": intent.expected_revision,
+            "expected_incarnation": child.registration_incarnation,
+            "expected_head": child.git_head,
+            "expected_root_fingerprint": child.root_fingerprint,
+        })
+        .to_string();
+        let (probe_id, receiver) = self
+            .runtime
+            .runner_registry
+            .enqueue_native_closeout_recovery_probe_for_instance(
+                client_id.clone(),
+                probe_request,
+                &instance_id,
+            )
+            .await
+            .map_err(|_| api_error(503, "native_closeout_recovery_probe_unavailable"))?;
+        let response = match tokio::time::timeout(Duration::from_secs(WAIT_SECS), receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => {
+                self.runtime.runner_registry.cancel_request(&probe_id).await;
+                return Err(api_error(
+                    503,
+                    "native_closeout_recovery_probe_indeterminate",
+                ));
+            }
+        };
+        if response.request_id != probe_id
+            || response.client_id != client_id
+            || response.error.is_some()
+        {
+            return Err(api_error(503, "native_closeout_recovery_probe_unverified"));
+        }
+        let evidence: Value = serde_json::from_str(response.stdout.as_deref().unwrap_or(""))
+            .map_err(|_| api_error(503, "native_closeout_recovery_probe_unverified"))?;
+        let (verified_origin_url, verified_remote_ref) = native_closeout_recovery_probe_matches(
+            response.exit_code,
+            &evidence,
+            child,
+            source,
+            &intent.expected_revision,
+        )
+        .map_err(|_| api_error(409, "native_closeout_recovery_probe_unverified"))?;
         let payload = native_closeout_bound_runner_payload(
             child,
             source,
             &intent.expected_revision,
             &intent.operation_id,
-            &intent.verified_origin_url,
-            &intent.verified_remote_ref,
+            &verified_origin_url,
+            &verified_remote_ref,
         )
         .map_err(|_| api_error(409, "native_closeout_binding_unverified"))?;
         let incarnation = child
@@ -565,7 +643,6 @@ impl AdminProjectLifecycleService {
             .as_deref()
             .ok_or_else(|| api_error(409, "native_closeout_identity_unverified"))?
             .to_string();
-        let instance_id = client.view.runner_instance_id.clone();
         let guards = begin_native_managed_closeout_fences(
             self.runtime.as_ref(),
             auth,
@@ -2146,6 +2223,71 @@ mod tests {
         .unwrap();
         assert_eq!(valid["phase"], "prepared");
         assert_eq!(valid["expected_incarnation"], incarnation);
+        let recovery = json!({
+            "operation": "native_managed_closeout_recovery_probe",
+            "changed": false,
+            "project_id": child.id,
+            "expected_revision": "sha256:revision",
+            "expected_incarnation": incarnation,
+            "expected_head": sha,
+            "expected_root_fingerprint": "wc_projroot_child",
+            "source_root_fingerprint": "wc_projroot_source",
+            "verified_origin_url": "https://github.com/example/repo.git",
+            "verified_remote_ref": "refs/heads/main",
+        });
+        assert_eq!(
+            native_closeout_recovery_probe_matches(
+                Some(0),
+                &recovery,
+                &child,
+                &source,
+                "sha256:revision"
+            ),
+            Ok((
+                "https://github.com/example/repo.git".into(),
+                "refs/heads/main".into()
+            ))
+        );
+        for field in [
+            "expected_revision",
+            "expected_incarnation",
+            "expected_head",
+            "expected_root_fingerprint",
+            "source_root_fingerprint",
+            "project_id",
+        ] {
+            let mut forged = recovery.clone();
+            forged[field] = json!("not-the-admitted-identity");
+            assert!(
+                native_closeout_recovery_probe_matches(
+                    Some(0),
+                    &forged,
+                    &child,
+                    &source,
+                    "sha256:revision"
+                )
+                .is_err(),
+                "identity forgery accepted for {field}"
+            );
+        }
+        let mut mutating = recovery.clone();
+        mutating["changed"] = json!(true);
+        assert!(native_closeout_recovery_probe_matches(
+            Some(0),
+            &mutating,
+            &child,
+            &source,
+            "sha256:revision"
+        )
+        .is_err());
+        assert!(native_closeout_recovery_probe_matches(
+            Some(1),
+            &recovery,
+            &child,
+            &source,
+            "sha256:revision"
+        )
+        .is_err());
         assert_eq!(valid["source_root"], "/tmp/source");
         assert_eq!(valid["expected_head"], sha);
         assert!(make(&child, &source, "", "refs/heads/main").is_err());

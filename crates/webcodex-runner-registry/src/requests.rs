@@ -2488,6 +2488,27 @@ impl RunnerRegistry {
         .await
     }
 
+    /// Read-only exact-source Git recovery probe, bound to the selected
+    /// Runner process. A generic project tool cannot enqueue it unfenced.
+    pub async fn enqueue_native_closeout_recovery_probe_for_instance(
+        &self,
+        client_id: String,
+        payload: String,
+        expected_runner_instance_id: &str,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        if expected_runner_instance_id.is_empty() {
+            return Err("native_closeout_runner_instance_missing".into());
+        }
+        self.enqueue_project_op_checked(
+            client_id,
+            "native_managed_closeout_recovery_probe",
+            payload,
+            "server_native_closeout_owner_probe".into(),
+            Some(expected_runner_instance_id),
+        )
+        .await
+    }
+
     async fn enqueue_project_op_checked(
         &self,
         client_id: String,
@@ -2505,6 +2526,7 @@ impl RunnerRegistry {
                 | "prepare_managed_worktree"
                 | "native_managed_closeout"
                 | "native_managed_closeout_receipt"
+                | "native_managed_closeout_recovery_probe"
                 | "project_lifecycle_enable"
                 | "project_lifecycle_disable"
                 | "project_lifecycle_unregister"
@@ -2518,7 +2540,9 @@ impl RunnerRegistry {
         let required_feature = match kind {
             "resolve_or_register_project" => Some(RunnerFeature::ProjectPathRegistration),
             "prepare_managed_worktree" => Some(RunnerFeature::ManagedWorktree),
-            "native_managed_closeout" | "native_managed_closeout_receipt" => {
+            "native_managed_closeout"
+            | "native_managed_closeout_receipt"
+            | "native_managed_closeout_recovery_probe" => {
                 Some(RunnerFeature::NativeManagedCloseout)
             }
             "project_lifecycle_enable"

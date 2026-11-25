@@ -89,6 +89,102 @@ pub(crate) fn handle_native_managed_closeout_operation(
     }
 }
 
+/// Read-only source-bound recovery evidence for one exact registered worktree.
+/// Caller-supplied paths and remote refs are never accepted. Registry metadata
+/// is descriptive identity; this response is NOT authority to delete.
+pub(crate) fn handle_native_closeout_recovery_probe_operation(
+    policy: &super::config::RunnerPolicy,
+    registry: &std::path::Path,
+    operation: &webcodex_core::runner_operation::RunnerProjectOperation,
+) -> CommandResult {
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        project_id: String,
+        expected_revision: String,
+        expected_incarnation: String,
+        expected_head: String,
+        expected_root_fingerprint: String,
+    }
+    let start = Instant::now();
+    if operation.kind != webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseoutRecoveryProbe
+        || operation.payload.len() > 2048
+    {
+        return project_error_cmd(start, "native_closeout_probe_invalid_request");
+    }
+    let query: Request = match serde_json::from_str(&operation.payload) {
+        Ok(query) => query,
+        Err(_) => return project_error_cmd(start, "native_closeout_probe_invalid_request"),
+    };
+    if registration::validate_project_op_id(&query.project_id).is_err()
+        || uuid::Uuid::parse_str(&query.expected_incarnation).is_err()
+        || !matches!(query.expected_head.len(), 40 | 64)
+        || !query.expected_head.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return project_error_cmd(start, "native_closeout_probe_invalid_identity");
+    }
+    let result = (|| -> Result<serde_json::Value, &'static str> {
+        let _lock = project_registry_write_lock()
+            .lock()
+            .map_err(|_| "native_closeout_registry_lock_failed")?;
+        let projects = registration::load_project_files_for_path_resolution(registry)
+            .map_err(|_| "native_closeout_registry_unverified")?;
+        let child = projects
+            .iter()
+            .find(|project| project.id == query.project_id)
+            .ok_or("native_closeout_probe_project_missing")?;
+        if catalog::project_revision(child) != query.expected_revision
+            || child.registration_incarnation.as_deref()
+                != Some(query.expected_incarnation.as_str())
+            || child.managed_base_sha.as_deref() != Some(query.expected_head.as_str())
+            || !child.managed_worktree
+            || catalog::effective_registration_source(child).as_str() != "auto_registered"
+        {
+            return Err("native_closeout_probe_identity_conflict");
+        }
+        let source = projects
+            .iter()
+            .find(|entry| Some(entry.id.as_str()) == child.managed_source_project_id.as_deref())
+            .ok_or("native_closeout_probe_source_missing")?;
+        managed_worktree::managed_worktree_reclaim_lineage_gate(child, source)?;
+        let child_root = super::shell::canonicalize_existing(std::path::Path::new(&child.path))
+            .map_err(|_| "native_closeout_probe_root_unverified")?;
+        let source_root = super::shell::canonicalize_existing(std::path::Path::new(&source.path))
+            .map_err(|_| "native_closeout_probe_source_unverified")?;
+        if registration::validate_project_path_policy(policy, &child_root).is_err()
+            || registration::validate_project_path_policy(policy, &source_root).is_err()
+            || catalog::project_root_fingerprint(&child_root) != query.expected_root_fingerprint
+        {
+            return Err("native_closeout_probe_root_conflict");
+        }
+        // Do not hold the registry write/CAS mutex across bounded remote I/O.
+        // The final destructive Owner path independently repeats its full
+        // registration and remote CAS checks before any deletion.
+        drop(_lock);
+        let (origin, remote_ref) = managed_worktree::managed_worktree_unique_remote_recovery(
+            &source_root,
+            &query.expected_head,
+        )?;
+        Ok(serde_json::json!({
+            "operation": "native_managed_closeout_recovery_probe",
+            "changed": false,
+            "project_id": query.project_id,
+            "expected_revision": query.expected_revision,
+            "expected_incarnation": query.expected_incarnation,
+            "expected_head": query.expected_head,
+            "expected_root_fingerprint": query.expected_root_fingerprint,
+            "source_root_fingerprint": catalog::project_root_fingerprint(&source_root),
+            "verified_origin_url": origin,
+            "verified_remote_ref": remote_ref,
+        }))
+    })();
+    match result {
+        Ok(payload) => crate::webcodex_runner::output::ok_cmd(start, payload),
+        Err(reason) => project_error_cmd(start, reason),
+    }
+}
+
 /// Recovery observation never invokes a Git removal, unregister, or journal
 /// phase transition. It only returns an exact already-committed terminal.
 #[allow(dead_code)]

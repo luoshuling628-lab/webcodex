@@ -5,12 +5,12 @@ use super::transport::ResultSubmission;
 use super::validation::handle_validation_request;
 use super::{
     handle_browser_operation, handle_computer_operation, handle_native_closeout_receipt_operation,
-    handle_native_managed_closeout_operation, handle_prepare_managed_worktree_operation,
-    handle_project_lifecycle_operation, handle_project_operation,
-    handle_resolve_or_register_project_operation, handle_runner_instruction_request,
-    handle_runner_skill_request, run_ssh_shell_with_execution_state, CommandResult,
-    HotRunnerConfig, PersistentShellManager, ReloadableRunnerConfig, RunnerSink,
-    ShellCommandResult, SubmitResultError,
+    handle_native_closeout_recovery_probe_operation, handle_native_managed_closeout_operation,
+    handle_prepare_managed_worktree_operation, handle_project_lifecycle_operation,
+    handle_project_operation, handle_resolve_or_register_project_operation,
+    handle_runner_instruction_request, handle_runner_skill_request,
+    run_ssh_shell_with_execution_state, CommandResult, HotRunnerConfig, PersistentShellManager,
+    ReloadableRunnerConfig, RunnerSink, ShellCommandResult, SubmitResultError,
 };
 use crate::webcodex_runner::file_dispatch::handle_file_operation_with_artifact_store;
 use crate::webcodex_runner::runner_skills::run_skill_resource;
@@ -690,6 +690,13 @@ pub(crate) fn dispatch_request_with_outcome(
                         policy,
                         project_registry_dir,
                         &client_id,
+                        &operation,
+                    )
+                }
+                RunnerProjectOperationKind::NativeManagedCloseoutRecoveryProbe => {
+                    handle_native_closeout_recovery_probe_operation(
+                        policy,
+                        project_registry_dir,
                         &operation,
                     )
                 }
