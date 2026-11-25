@@ -28,6 +28,9 @@ pub(super) struct McpGatewayDispatchFence {
 pub(super) enum PendingDispatchFence {
     Unfenced,
     Project(ProjectDispatchFence),
+    NativeCloseout {
+        runner_instance_id: String,
+    },
     McpGateway(McpGatewayDispatchFence),
     RunnerInstruction {
         runner_instance_id: String,
@@ -56,11 +59,35 @@ impl PendingDispatchFence {
             (Self::Unfenced, operation) => !matches!(
                 operation,
                 RunnerOperation::McpGateway(_)
+                    | RunnerOperation::Project(webcodex_core::runner_operation::RunnerProjectOperation {
+                        kind: webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseout,
+                        ..
+                    })
+                    | RunnerOperation::Project(webcodex_core::runner_operation::RunnerProjectOperation {
+                        kind: webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseoutReceipt,
+                        ..
+                    })
+                    | RunnerOperation::Project(webcodex_core::runner_operation::RunnerProjectOperation {
+                        kind: webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseoutRecoveryProbe,
+                        ..
+                    })
                     | RunnerOperation::RunnerInstruction(_)
                     | RunnerOperation::RunnerConfig(_)
                     | RunnerOperation::SshResource(_)
                     | RunnerOperation::Skill(_)
             ),
+            (
+                Self::NativeCloseout { runner_instance_id },
+                RunnerOperation::Project(operation),
+            ) => {
+                !runner_instance_id.is_empty()
+                    && matches!(
+                        operation.kind,
+                        webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseout
+                            | webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseoutReceipt
+                            | webcodex_core::runner_operation::RunnerProjectOperationKind::NativeManagedCloseoutRecoveryProbe
+                    )
+            }
             (Self::Project(fence), RunnerOperation::File(_)) => {
                 !fence.project_id.is_empty()
                     && !fence.cwd.is_empty()
@@ -221,6 +248,14 @@ impl PendingDispatchFence {
                     .then(|| "capability_unavailable: Computer action or post-observation is unavailable before dispatch".into())
             }
             Self::Project(fence) => fence.rejection(operation, runner),
+            Self::NativeCloseout { runner_instance_id } => control_rejection(
+                runner,
+                runner_instance_id,
+                RunnerFeature::NativeManagedCloseout,
+                "native closeout",
+                "capability_unavailable",
+                "Native closeout capability changed before dispatch",
+            ),
             Self::Skill { runner_instance_id } => {
                 let Some(runner) = runner else {
                     return Some(

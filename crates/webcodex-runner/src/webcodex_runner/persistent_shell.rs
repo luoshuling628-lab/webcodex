@@ -13,6 +13,7 @@ use super::shell::shell_quote_powershell;
 use super::shell::{base_shell_env, cwd_allowed};
 use super::ssh::SshConnectionPool;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use webcodex_core::runner_operation::RunnerPersistentShellOperation;
 #[cfg(test)]
@@ -36,6 +37,8 @@ const TERMINAL_RECORDS: usize = 128;
 #[derive(Debug, Clone)]
 pub(crate) struct PersistentShellManager {
     processes: ProcessManager,
+    /// Reader admission for persistent shell operations, exclusive for native closeout.
+    closeout_admission: Arc<RwLock<()>>,
     /// Runner-local SSH authority/preparation state. Windows persistent SSH uses
     /// the named-resource resolver without Unix ControlMaster multiplexing.
     ssh_pool: SshConnectionPool,
@@ -60,8 +63,27 @@ impl PersistentShellManager {
     pub(crate) fn new(shell: &ShellConfig, ssh_pool: super::ssh::SshConnectionPool) -> Self {
         Self {
             processes: ProcessManager::new(limits(shell)),
+            closeout_admission: Arc::new(RwLock::new(())),
             ssh_pool,
         }
+    }
+
+    /// All persistent shell opens and execs share the read side; native
+    /// closeout takes the write side and must observe zero live processes.
+    /// This is independent of the JobManager fence and is not delete authority.
+    #[allow(dead_code)]
+    pub(crate) fn with_quiescent_shell_admission<T>(
+        &self,
+        execute: impl FnOnce() -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        let _exclusive = self
+            .closeout_admission
+            .write()
+            .map_err(|_| "native_closeout_shell_gate_poisoned")?;
+        if self.processes.active_count() != 0 {
+            return Err("native_closeout_persistent_shells_active");
+        }
+        execute()
     }
 
     pub(crate) fn handle_operation(
@@ -74,6 +96,21 @@ impl PersistentShellManager {
         client_id: &str,
         request: &RunnerPersistentShellOperation,
     ) -> PersistentShellResult {
+        // A closeout write guard waits for in-flight persistent shell commands
+        // and excludes new opens/execs through the entire filesystem effect.
+        let _admission = match self.closeout_admission.read() {
+            Ok(guard) => guard,
+            Err(_) => {
+                let operation = &request.request;
+                return error_result(
+                    &operation.shell_id,
+                    &operation.workflow_session_id,
+                    &operation.runtime_project_id,
+                    "persistent_shell_closeout_admission_poisoned",
+                    "persistent shell admission cannot be proven safe",
+                );
+            }
+        };
         self.processes.update_limits(limits(shell));
         let ssh_resource = request
             .job_context
@@ -237,6 +274,32 @@ fn limits(shell: &ShellConfig) -> ShellLimits {
         max_shells: shell.max_persistent_shells,
         idle_timeout: Duration::from_secs(shell.persistent_shell_idle_timeout_secs),
         max_terminal_records: TERMINAL_RECORDS,
+    }
+}
+
+#[cfg(test)]
+mod native_closeout_shell_gate_tests {
+    use super::*;
+
+    #[test]
+    fn native_closeout_excludes_persistent_shell_admission() {
+        let manager =
+            PersistentShellManager::new(&ShellConfig::default(), SshConnectionPool::default());
+        assert_eq!(
+            manager.with_quiescent_shell_admission(|| {
+                assert!(manager.closeout_admission.try_read().is_err());
+                Ok(23)
+            }),
+            Ok(23)
+        );
+        let clone = manager.clone();
+        assert_eq!(
+            clone.with_quiescent_shell_admission(|| {
+                assert!(manager.closeout_admission.try_read().is_err());
+                Ok(24)
+            }),
+            Ok(24)
+        );
     }
 }
 

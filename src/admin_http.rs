@@ -1,6 +1,7 @@
 use crate::admin_project_lifecycle::{
-    AdminProjectLifecycleService, CreateProjectRequest, ProjectMutationRequest,
-    RegisterProjectRequest, ServiceResponse, UpdateProjectAllowPatchRequest,
+    AdminProjectLifecycleService, CreateProjectRequest, NativeCloseoutAdmissionRequest,
+    ProjectMutationRequest, RegisterProjectRequest, ServiceResponse,
+    UpdateProjectAllowPatchRequest,
 };
 use crate::auth::{AuthContext, AuthKind};
 use crate::tool_runtime::activity::ActivityVisibility;
@@ -30,6 +31,10 @@ pub(crate) fn routes() -> Router {
         )
         .push(
             Router::with_path(api_path(RouteId::AdminProjectsUnregister)).post(unregister_project),
+        )
+        .push(
+            Router::with_path(api_path(RouteId::AdminProjectsNativeCloseoutAdmission))
+                .post(native_closeout_admission),
         )
 }
 
@@ -311,6 +316,19 @@ async fn disable_project(req: &mut Request, depot: &mut Depot, res: &mut Respons
 #[handler]
 async fn unregister_project(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     mutate_project("unregister", req, depot, res).await;
+}
+
+#[handler]
+async fn native_closeout_admission(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (auth, service) = match lifecycle_context(req, depot).await {
+        Ok(value) => value,
+        Err(response) => return render_service_response(res, response),
+    };
+    let body = match parse_admin_json::<NativeCloseoutAdmissionRequest>(req).await {
+        Ok(value) => value,
+        Err(response) => return render_service_response(res, response),
+    };
+    render_service_response(res, service.native_closeout_admission(&auth, body).await);
 }
 
 #[handler]
@@ -733,6 +751,74 @@ mod tests {
         assert_eq!(
             lifecycle_call(Some(admin), &unknown, true).await.0,
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn native_closeout_admission_route_is_admin_only_and_never_grants_delete() {
+        async fn admission(
+            auth: Option<AuthContext>,
+            origin: &str,
+            body: &str,
+        ) -> (StatusCode, Value) {
+            let mut response =
+                TestClient::post("http://127.0.0.1/admin/projects/native-closeout-admission")
+                    .add_header("host", "127.0.0.1", true)
+                    .add_header("content-type", "application/json", true)
+                    .add_header("origin", origin, true)
+                    .body(body.to_string())
+                    .send(&service(auth))
+                    .await;
+            (
+                response.status_code.unwrap(),
+                response.take_json::<Value>().await.unwrap(),
+            )
+        }
+        let valid = json!({
+            "project":"agent:managed-runner:disposable",
+            "expected_revision": format!("sha256:{}", "a".repeat(64))
+        })
+        .to_string();
+        assert_eq!(
+            admission(None, "http://127.0.0.1", &valid).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            admission(
+                Some(AuthContext::new(AuthKind::AgentToken)),
+                "http://127.0.0.1",
+                &valid
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        let mut admin = AuthContext::new(AuthKind::ApiToken);
+        admin.scopes.push(SCOPE_ADMIN.to_string());
+        assert_eq!(
+            admission(Some(admin.clone()), "http://evil.invalid", &valid)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let bad = json!({
+            "project":"agent:managed-runner:disposable",
+            "expected_revision": format!("sha256:{}", "a".repeat(64)),
+            "delete_authorized":true
+        })
+        .to_string();
+        assert_eq!(
+            admission(Some(admin.clone()), "http://127.0.0.1", &bad)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, body) = admission(Some(admin), "http://127.0.0.1", &valid).await;
+        // No connected Runner or exact Project in this isolated server.
+        assert_ne!(status, StatusCode::OK);
+        assert_ne!(
+            body.get("delete_authorized").and_then(Value::as_bool),
+            Some(true)
         );
     }
 

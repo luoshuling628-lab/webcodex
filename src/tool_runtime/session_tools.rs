@@ -570,6 +570,32 @@ impl ToolRuntime {
                         }),
                     );
                 }
+                // A real durable close and its idempotent replay both recheck
+                // trusted Owner admission. Replay matters if the Server dies
+                // after flushing Closed but before entering the Owner.
+                // Never synthesize admin authority; the current production
+                // Runner does not advertise NativeManagedCloseout, so only
+                // bounded read-only observation runs until release admission.
+                if outcome
+                    .summary
+                    .project
+                    .as_deref()
+                    .is_some_and(|project| project.starts_with("agent:"))
+                {
+                    // Do NOT wrap destructive execution in the short read-only
+                    // observation timeout: cancellation could release Server
+                    // fences before the Runner's terminal receipt is reconciled.
+                    let wakeup = crate::admin_project_lifecycle::execute_native_closeout_from_durable_session_close(
+                        self,
+                        auth,
+                        outcome.summary.project.as_deref(),
+                    ).await;
+                    tracing::info!(
+                        session_id = %outcome.summary.session_id,
+                        wakeup_outcome = wakeup,
+                        "Durable Session close Native Owner admission"
+                    );
+                }
                 ToolResult::ok(json!({
                     "success": true,
                     "session_id": outcome.summary.session_id,

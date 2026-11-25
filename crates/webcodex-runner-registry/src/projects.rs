@@ -272,6 +272,40 @@ impl RunnerRegistry {
         Ok(changed)
     }
 
+    /// CAS reconciliation for an exact completed native closeout. A project
+    /// that was re-registered with a new incarnation must never be removed
+    /// using an old Runner receipt. Missing is idempotent only after the
+    /// Native Owner independently verifies the terminal Runner journal.
+    pub async fn reconcile_native_closeout_project_for_instance(
+        &self,
+        client_id: &str,
+        runner_instance_id: &str,
+        project_id: &str,
+        expected_incarnation: &str,
+    ) -> Result<bool, String> {
+        if expected_incarnation.is_empty() {
+            return Err("native_closeout_incarnation_missing".into());
+        }
+        let mut inner = self.inner.lock().await;
+        let runner = inner
+            .runners
+            .get_mut(client_id)
+            .ok_or_else(|| format!("unknown shell client: {client_id}"))?;
+        if runner.runner_instance_id != runner_instance_id {
+            return Err("native_closeout_runner_instance_conflict".into());
+        }
+        if let Some(existing) = runner.projects.iter().find(|p| p.id == project_id) {
+            if existing.registration_incarnation.as_deref() != Some(expected_incarnation) {
+                return Err("native_closeout_projection_cas_conflict".into());
+            }
+        }
+        let before = runner.projects.len();
+        runner.projects.retain(|p| p.id != project_id);
+        let changed = before != runner.projects.len();
+        reconcile_dynamic_projection(runner, crate::registry::now_ts());
+        Ok(changed)
+    }
+
     #[cfg(test)]
     pub async fn upsert_runner_project(
         &self,

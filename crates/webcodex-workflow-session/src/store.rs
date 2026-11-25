@@ -157,6 +157,137 @@ pub struct SessionProjectUnregisterGuard {
     project: String,
 }
 
+impl SessionProjectUnregisterGuard {
+    /// Atomically upgrade this *already-held* native Session gate to a
+    /// restart-safe reservation. This does not authorize deletion or release
+    /// the Runner's separate Job-start fence. The guard remains held until
+    /// the caller drops it, while the durable block remains until terminal
+    /// reconciliation.
+    pub fn persist_managed_closeout(&self, operation_id: &str) -> Result<(), String> {
+        if operation_id.is_empty()
+            || operation_id.len() > 128
+            || !operation_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("invalid_durable_closeout_identity".to_string());
+        }
+        let mut inner = self
+            .store
+            .inner
+            .lock()
+            .map_err(|_| "session_store_unavailable")?;
+        if !inner.unregistering_projects.contains(&self.project) {
+            return Err("native_closeout_transient_fence_missing".to_string());
+        }
+        if let Some(current) = inner.durable_closeout_projects.get(&self.project) {
+            return if current == operation_id {
+                Ok(())
+            } else {
+                Err("durable_closeout_operation_conflict".to_string())
+            };
+        }
+        if !inner.sessions.values().any(|entry| {
+            entry.project() == Some(self.project.as_str())
+                && entry.lifecycle() == SessionLifecycle::Closed
+        }) || inner.sessions.values().any(|entry| {
+            entry.project() == Some(self.project.as_str())
+                && entry.lifecycle() == SessionLifecycle::Active
+        }) {
+            return Err("native_closeout_sessions_not_closed".to_string());
+        }
+        let database = inner
+            .persistence
+            .as_ref()
+            .ok_or_else(|| "durable_closeout_requires_database".to_string())?
+            .database
+            .clone();
+        // The transient fence is already active. A failed or indeterminate
+        // SQLite commit cannot open a Session admission gap.
+        database
+            .reserve_managed_closeout(&self.project, operation_id)
+            .map_err(|_| "durable_closeout_persistence_uncertain".to_string())?;
+        inner
+            .durable_closeout_projects
+            .insert(self.project.clone(), operation_id.to_string());
+        Ok(())
+    }
+    /// Atomic durable reservation of the exact, validated Runner request.
+    /// The descriptor and Session exclusion share one SQLite transaction;
+    /// a crash cannot leave a new operation ID without its recovery identity.
+    pub fn persist_managed_closeout_with_binding(
+        &self,
+        operation_id: &str,
+        payload_json: &str,
+    ) -> Result<(), String> {
+        if operation_id.is_empty()
+            || operation_id.len() > 128
+            || !operation_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || payload_json.len() > 8192
+        {
+            return Err("invalid_durable_closeout_identity".into());
+        }
+        let payload: serde_json::Value =
+            serde_json::from_str(payload_json).map_err(|_| "invalid_durable_closeout_binding")?;
+        if payload
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(operation_id)
+            || payload
+                .get("project_id")
+                .and_then(serde_json::Value::as_str)
+                != self.project.rsplit(':').next()
+            || payload.get("phase").and_then(serde_json::Value::as_str) != Some("prepared")
+            || payload
+                .get("expected_incarnation")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            || payload
+                .get("expected_head")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+        {
+            return Err("invalid_durable_closeout_binding".into());
+        }
+        let mut inner = self
+            .store
+            .inner
+            .lock()
+            .map_err(|_| "session_store_unavailable")?;
+        if !inner.unregistering_projects.contains(&self.project) {
+            return Err("native_closeout_transient_fence_missing".into());
+        }
+        if let Some(current) = inner.durable_closeout_projects.get(&self.project) {
+            if current != operation_id {
+                return Err("durable_closeout_operation_conflict".into());
+            }
+        } else if !inner.sessions.values().any(|entry| {
+            entry.project() == Some(self.project.as_str())
+                && entry.lifecycle() == SessionLifecycle::Closed
+        }) || inner.sessions.values().any(|entry| {
+            entry.project() == Some(self.project.as_str())
+                && entry.lifecycle() == SessionLifecycle::Active
+        }) {
+            return Err("native_closeout_sessions_not_closed".into());
+        }
+        let database = inner
+            .persistence
+            .as_ref()
+            .ok_or("durable_closeout_requires_database")?
+            .database
+            .clone();
+        database
+            .reserve_managed_closeout_with_binding(&self.project, operation_id, payload_json)
+            .map_err(|_| "durable_closeout_binding_commit_uncertain")?;
+        inner
+            .durable_closeout_projects
+            .insert(self.project.clone(), operation_id.to_string());
+        Ok(())
+    }
+}
+
 impl Drop for SessionProjectUnregisterGuard {
     fn drop(&mut self) {
         let mut inner = self
@@ -164,7 +295,10 @@ impl Drop for SessionProjectUnregisterGuard {
             .inner
             .lock()
             .expect("session store mutex poisoned");
-        inner.unregistering_projects.remove(&self.project);
+        inner.recovering_closeouts.remove(&self.project);
+        if !inner.durable_closeout_projects.contains_key(&self.project) {
+            inner.unregistering_projects.remove(&self.project);
+        }
     }
 }
 
@@ -173,6 +307,8 @@ pub(super) struct SessionStoreInner {
     /// Durable workflow sessions. Mutated only via the helpers below.
     sessions: SessionRecords,
     unregistering_projects: BTreeSet<String>,
+    durable_closeout_projects: BTreeMap<String, String>,
+    recovering_closeouts: BTreeSet<String>,
     lru: SessionRecency,
     hot_session_capacity_target: usize,
     cache_target_bytes: usize,
@@ -209,6 +345,8 @@ impl SessionStore {
             inner: Arc::new(Mutex::new(SessionStoreInner {
                 sessions: SessionRecords::default(),
                 unregistering_projects: BTreeSet::new(),
+                durable_closeout_projects: BTreeMap::new(),
+                recovering_closeouts: BTreeSet::new(),
                 lru: SessionRecency::default(),
                 hot_session_capacity_target,
                 cache_target_bytes: DEFAULT_SESSION_CACHE_BYTES,
@@ -299,12 +437,16 @@ impl SessionStore {
             tombstones.insert(ordinal, tombstone);
         }
         let restored_sessions = sessions.len();
+        let durable_closeout_projects = database.managed_closeout_fences()?;
+        let durable_closeout_blocked = durable_closeout_projects.keys().cloned().collect();
         let inner = Arc::new(Mutex::new(SessionStoreInner {
             sessions: SessionRecords {
                 generation,
                 ..SessionRecords::restored(sessions)
             },
-            unregistering_projects: BTreeSet::new(),
+            unregistering_projects: durable_closeout_blocked,
+            durable_closeout_projects,
+            recovering_closeouts: BTreeSet::new(),
             lru,
             hot_session_capacity_target: DEFAULT_MAX_SESSIONS,
             cache_target_bytes,
@@ -977,15 +1119,301 @@ impl SessionStore {
         &self,
         project: &str,
     ) -> Result<SessionProjectUnregisterGuard, String> {
+        self.begin_project_retirement_fence(project, false)
+    }
+
+    /// Reserve one durable exact managed closeout in the existing SQLite
+    /// Session domain before the Server submits any Runner removal request.
+    /// A restart restores the block before accepting new Sessions. Unlike the
+    /// transient SessionProjectUnregisterGuard, this reservation is NOT removed
+    /// on Drop, timeout or cancellation. It awaits exact terminal reconciliation.
+    pub fn reserve_durable_managed_worktree_closeout(
+        &self,
+        project: &str,
+        operation_id: &str,
+    ) -> Result<(), String> {
+        if project.is_empty()
+            || operation_id.is_empty()
+            || operation_id.len() > 128
+            || !operation_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("invalid_durable_closeout_identity".to_string());
+        }
+        let mut inner = self.inner.lock().map_err(|_| "session_store_unavailable")?;
+        if let Some(current) = inner.durable_closeout_projects.get(project) {
+            return if current == operation_id {
+                Ok(())
+            } else {
+                Err("durable_closeout_operation_conflict".to_string())
+            };
+        }
+        if inner.unregistering_projects.contains(project) {
+            return Err("project_retirement_already_in_progress".to_string());
+        }
+        let mut closed_count = 0_usize;
+        for record in inner.sessions.values() {
+            if record.project() != Some(project) {
+                continue;
+            }
+            match record.lifecycle() {
+                SessionLifecycle::Active => {
+                    return Err("managed_worktree_active_sessions".to_string())
+                }
+                SessionLifecycle::Closed => closed_count += 1,
+            }
+        }
+        if closed_count == 0 {
+            return Err("managed_worktree_no_closed_sessions".to_string());
+        }
+        let db = inner
+            .persistence
+            .as_ref()
+            .ok_or_else(|| "durable_closeout_requires_database".to_string())?
+            .database
+            .clone();
+        // Install in-memory exclusion before SQLite mutation under the
+        // Session creation mutex. If the database commit acknowledgement is
+        // indeterminate, keep the project blocked until independent recovery.
+        inner.unregistering_projects.insert(project.to_string());
+        if db.reserve_managed_closeout(project, operation_id).is_err() {
+            return Err("durable_closeout_persistence_uncertain".to_string());
+        }
+        inner
+            .durable_closeout_projects
+            .insert(project.to_string(), operation_id.to_string());
+        Ok(())
+    }
+
+    /// Read-only cold-restart reconciliation hint. Does not release or
+    /// transfer authority; a matching operation still needs a verified Runner
+    /// terminal receipt before the durable block may be cleared.
+    pub fn durable_managed_worktree_closeout(&self, project: &str) -> Option<String> {
+        let inner = self.inner.lock().ok()?;
+        inner.durable_closeout_projects.get(project).cloned()
+    }
+
+    /// Cold-start exact-binding lookup. A Session lease without a matching
+    /// committed descriptor remains blocked; it must not be reconstructed
+    /// from a missing Project inventory row or a guessed Git remote.
+    pub fn durable_managed_worktree_binding(
+        &self,
+        project: &str,
+        operation_id: &str,
+    ) -> Result<Option<String>, String> {
+        let inner = self.inner.lock().map_err(|_| "session_store_unavailable")?;
+        if inner
+            .durable_closeout_projects
+            .get(project)
+            .map(String::as_str)
+            != Some(operation_id)
+        {
+            return Err("durable_closeout_operation_conflict".into());
+        }
+        let database = inner
+            .persistence
+            .as_ref()
+            .ok_or("durable_closeout_requires_database")?
+            .database
+            .clone();
+        database
+            .managed_closeout_binding(project, operation_id)
+            .map_err(|_| "durable_closeout_binding_unavailable".into())
+    }
+
+    /// Read-only startup inventory for the existing Native Closeout Owner.
+    /// A durable lease without an exact bound descriptor is NOT recoverable:
+    /// refuse the entire scan rather than silently skipping that Project.
+    /// This never creates a Session, grants admin authority, dispatches Runner
+    /// operations, or releases any durable block.
+    pub fn pending_managed_worktree_recovery_bindings(
+        &self,
+    ) -> Result<Vec<(String, String, String)>, String> {
+        let inner = self.inner.lock().map_err(|_| "session_store_unavailable")?;
+        let database = inner
+            .persistence
+            .as_ref()
+            .ok_or("durable_closeout_requires_database")?
+            .database
+            .clone();
+        let mut pending = Vec::with_capacity(inner.durable_closeout_projects.len());
+        for (project, operation_id) in &inner.durable_closeout_projects {
+            if !inner.unregistering_projects.contains(project) {
+                return Err("durable_closeout_admission_fence_missing".into());
+            }
+            let json = database
+                .managed_closeout_binding(project, operation_id)
+                .map_err(|_| "durable_closeout_binding_unavailable")?
+                .ok_or("durable_closeout_binding_missing")?;
+            let payload: serde_json::Value =
+                serde_json::from_str(&json).map_err(|_| "durable_closeout_binding_invalid")?;
+            if payload.get("operation_id").and_then(|v| v.as_str()) != Some(operation_id.as_str())
+                || payload.get("phase").and_then(|v| v.as_str()) != Some("prepared")
+                || payload.get("project_id").and_then(|v| v.as_str()).is_none()
+            {
+                return Err("durable_closeout_binding_invalid".into());
+            }
+            pending.push((project.clone(), operation_id.clone(), json));
+        }
+        Ok(pending)
+    }
+
+    /// Exact terminal closeout reconciliation, internal to this Session
+    /// domain. The trusted Server Native Owner must validate the Runner
+    /// registration-incarnation, job completion and durable Git-removed
+    /// receipt BEFORE calling this function. A response body or a timeout is
+    /// never itself proof. This primitive is not a public release API.
+    #[allow(dead_code)]
+    pub fn reconcile_durable_managed_closeout_terminal(
+        &self,
+        project: &str,
+        operation_id: &str,
+    ) -> Result<(), String> {
+        let mut inner = self.inner.lock().map_err(|_| "session_store_unavailable")?;
+        let Some(saved) = inner.durable_closeout_projects.get(project) else {
+            return Err("durable_closeout_not_reserved".to_string());
+        };
+        if saved != operation_id {
+            return Err("durable_closeout_operation_conflict".to_string());
+        }
+        // No Session may be created until the SQLite release commit is
+        // confirmed, under the same Session admission mutex.
+        let db = inner
+            .persistence
+            .as_ref()
+            .ok_or_else(|| "durable_closeout_requires_database".to_string())?
+            .database
+            .clone();
+        db.release_managed_closeout(project, operation_id)
+            .map_err(|_| "durable_closeout_terminal_release_uncertain".to_string())?;
+        inner.durable_closeout_projects.remove(project);
+        inner.unregistering_projects.remove(project);
+        Ok(())
+    }
+
+    /// Dedicated Session-side gate for *automatic managed-worktree cleanup*.
+    ///
+    /// Unlike ordinary unregister (which must preserve historical close/read
+    /// workflows), physical reclamation cannot start while any Session of the
+    /// exact Project is active. The check and reservation share the same lock,
+    /// preventing a new Session from racing the decision. This gate is NOT a
+    /// deletion permit: Runner jobs/leases, exact Project incarnation, Git
+    /// recoverability, and durable Owner receipts require separate proof.
+    pub fn begin_managed_worktree_cleanup_fence(
+        &self,
+        project: &str,
+    ) -> Result<SessionProjectUnregisterGuard, String> {
+        self.begin_project_retirement_fence(project, true)
+    }
+
+    fn begin_project_retirement_fence(
+        &self,
+        project: &str,
+        require_all_closed: bool,
+    ) -> Result<SessionProjectUnregisterGuard, String> {
         let mut inner = self.inner.lock().expect("session store mutex poisoned");
         if inner.unregistering_projects.contains(project) {
             return Err("project_retirement_already_in_progress".to_string());
+        }
+        if require_all_closed {
+            let mut closed_count = 0usize;
+            for record in inner.sessions.values() {
+                if record.project() != Some(project) {
+                    continue;
+                }
+                match record.lifecycle() {
+                    SessionLifecycle::Active => {
+                        return Err("managed_worktree_active_sessions".to_string());
+                    }
+                    SessionLifecycle::Closed => closed_count += 1,
+                }
+            }
+            if closed_count == 0 {
+                return Err("managed_worktree_no_closed_sessions".to_string());
+            }
         }
         inner.unregistering_projects.insert(project.to_string());
         Ok(SessionProjectUnregisterGuard {
             store: self.clone(),
             project: project.to_string(),
         })
+    }
+
+    /// Resume an already-persisted native closeout after Server restart or
+    /// transport ambiguity, without ever clearing its Session admission block.
+    /// Exact operation identity is mandatory; one recovery owner per Project
+    /// may hold this transient guard. This does not itself authorize deletion
+    /// or replace the Runner's separate Job-start fence.
+    pub fn begin_managed_worktree_recovery_fence(
+        &self,
+        project: &str,
+        operation_id: &str,
+    ) -> Result<SessionProjectUnregisterGuard, String> {
+        let mut inner = self.inner.lock().map_err(|_| "session_store_unavailable")?;
+        match inner.durable_closeout_projects.get(project) {
+            Some(saved) if saved == operation_id => {}
+            Some(_) => return Err("durable_closeout_operation_conflict".to_string()),
+            None => return Err("durable_closeout_not_reserved".to_string()),
+        }
+        if !inner.unregistering_projects.contains(project) {
+            return Err("durable_closeout_admission_fence_missing".to_string());
+        }
+        if inner.recovering_closeouts.contains(project) {
+            return Err("native_closeout_recovery_already_in_progress".to_string());
+        }
+        if inner.sessions.values().any(|entry| {
+            entry.project() == Some(project) && entry.lifecycle() == SessionLifecycle::Active
+        }) {
+            return Err("managed_worktree_active_sessions".to_string());
+        }
+        // Only the transient recovery lock is new. Durable blocks and SQLite
+        // identity remain unchanged until trusted terminal reconciliation.
+        inner.recovering_closeouts.insert(project.to_string());
+        Ok(SessionProjectUnregisterGuard {
+            store: self.clone(),
+            project: project.to_string(),
+        })
+    }
+
+    /// Read-only cold-start candidate discovery for the existing Native
+    /// Closeout Owner. This is not execution authority: the Owner must still
+    /// verify the exact live Runner registration, all jobs/shells, Git remote
+    /// recoverability and its own durable deletion intent before mutation.
+    ///
+    /// Closed Session state is already persisted by SessionStore; deriving
+    /// candidates from that state makes a missed close notification retryable
+    /// after Server restart without storing a second, weaker work queue.
+    /// Retention may erase a candidate, so this is best-effort discovery,
+    /// never a proof of absence or a permit to infer project ownership.
+    pub fn discover_closed_managed_worktree_candidates(&self) -> Vec<String> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut states = std::collections::BTreeMap::<String, (bool, bool)>::new();
+        for record in inner.sessions.values() {
+            let Some(project) = record.project() else {
+                continue;
+            };
+            if !project.starts_with("agent:") {
+                continue;
+            }
+            let status = states.entry(project.to_owned()).or_default();
+            match record.lifecycle() {
+                SessionLifecycle::Closed => status.0 = true,
+                SessionLifecycle::Active => status.1 = true,
+            }
+        }
+        states
+            .into_iter()
+            .filter_map(|(project, (has_closed, has_active))| {
+                (has_closed
+                    && !has_active
+                    && !inner.unregistering_projects.contains(&project)
+                    && !inner.durable_closeout_projects.contains_key(&project))
+                .then_some(project)
+            })
+            .collect()
     }
 
     /// Cross-authority metadata count. Never leaks Session ID or content.

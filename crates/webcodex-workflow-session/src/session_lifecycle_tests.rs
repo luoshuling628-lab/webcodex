@@ -53,6 +53,445 @@ fn session_tool_contract(tool_name: &str) -> SessionToolContract {
 }
 
 #[test]
+fn native_closed_worktree_discovery_recovers_after_restart_and_never_infers_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("closed-discovery.json");
+    let eligible = "agent:runner:closed-managed";
+    let active_project = "agent:runner:still-active";
+    let first = persistent_store(ledger.clone());
+    let closed = first.start_session_with_guards(
+        Some(eligible.into()),
+        Some("closed".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    let active = first.start_session_with_guards(
+        Some(active_project.into()),
+        Some("active".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    let ordinary = first.start_session_with_guards(
+        Some("local:ordinary".into()),
+        Some("not managed".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    first.close_session(&closed.session_id).unwrap();
+    first.close_session(&ordinary.session_id).unwrap();
+    first.flush_persistence();
+    assert_eq!(
+        first.discover_closed_managed_worktree_candidates(),
+        vec![eligible.to_string()],
+    );
+    drop(first);
+
+    // A restart discovers the already durable close without any new event,
+    // authorization, callback invocation, or deletion intent.
+    let restarted = persistent_store(ledger);
+    assert_eq!(
+        restarted.discover_closed_managed_worktree_candidates(),
+        vec![eligible.to_string()],
+    );
+    assert!(restarted
+        .durable_managed_worktree_closeout(eligible)
+        .is_none());
+    let competing = restarted.start_session_with_guards(
+        Some(eligible.into()),
+        Some("new active".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    assert!(restarted
+        .discover_closed_managed_worktree_candidates()
+        .is_empty());
+    restarted.close_session(&competing.session_id).unwrap();
+    assert_eq!(
+        restarted.discover_closed_managed_worktree_candidates(),
+        vec![eligible.to_string()],
+    );
+    let guard = restarted
+        .begin_managed_worktree_cleanup_fence(eligible)
+        .unwrap();
+    assert!(restarted
+        .discover_closed_managed_worktree_candidates()
+        .is_empty());
+    drop(guard);
+    assert_eq!(
+        restarted.discover_closed_managed_worktree_candidates(),
+        vec![eligible.to_string()],
+    );
+    assert_eq!(
+        restarted.retained_project_session_counts(active_project),
+        (1, 0)
+    );
+    assert!(restarted.summary(&active.session_id, Some(5)).is_some());
+}
+
+#[test]
+fn native_closeout_atomic_descriptor_survives_restart_and_exact_release() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("native-bound-recovery.json");
+    let project = "agent:runner:managed-child";
+    let first = persistent_store(ledger.clone());
+    let session = first.start_session_with_guards(
+        Some(project.into()),
+        Some("closed".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    first.close_session(&session.session_id).unwrap();
+    first.flush_persistence();
+    let guard = first.begin_managed_worktree_cleanup_fence(project).unwrap();
+    let payload = serde_json::json!({
+        "operation_id": "operation-1",
+        "project_id": "managed-child",
+        "phase": "prepared",
+        "expected_incarnation": "incarnation-1",
+        "expected_head": "a".repeat(40),
+        "expected_revision": "sha256:revision",
+        "source_root": "/source",
+        "worktree_root": "/child",
+        "expected_origin_url": "/remote",
+        "expected_remote_ref": "refs/heads/main",
+    })
+    .to_string();
+    assert!(guard
+        .persist_managed_closeout_with_binding("operation-1", "{")
+        .is_err());
+    assert_eq!(first.durable_managed_worktree_closeout(project), None);
+    guard
+        .persist_managed_closeout_with_binding("operation-1", &payload)
+        .unwrap();
+    assert!(guard
+        .persist_managed_closeout_with_binding("operation-1", &payload)
+        .is_ok());
+    let other = payload.replace("refs/heads/main", "refs/heads/other");
+    assert!(guard
+        .persist_managed_closeout_with_binding("operation-1", &other)
+        .is_err());
+    drop(guard);
+    drop(first);
+
+    let restarted = persistent_store(ledger.clone());
+    let pending = restarted
+        .pending_managed_worktree_recovery_bindings()
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0, project);
+    assert_eq!(pending[0].1, "operation-1");
+    assert_eq!(pending[0].2, payload);
+    assert_eq!(
+        restarted.durable_managed_worktree_closeout(project),
+        Some("operation-1".into())
+    );
+    assert_eq!(
+        restarted
+            .durable_managed_worktree_binding(project, "operation-1")
+            .unwrap(),
+        Some(payload.clone())
+    );
+    assert!(restarted
+        .durable_managed_worktree_binding(project, "operation-stale")
+        .is_err());
+    let resume = restarted
+        .begin_managed_worktree_recovery_fence(project, "operation-1")
+        .unwrap();
+    resume
+        .persist_managed_closeout_with_binding("operation-1", &payload)
+        .unwrap();
+    drop(resume);
+    assert!(restarted
+        .start_session_with_options(crate::SessionCreateOptions::new(
+            Some(project.into()),
+            Some("still fenced".into()),
+            SessionMode::ReadOnly,
+            SessionGuards::default(),
+        ))
+        .is_err());
+    restarted
+        .reconcile_durable_managed_closeout_terminal(project, "operation-1")
+        .unwrap();
+    assert!(restarted
+        .durable_managed_worktree_binding(project, "operation-1")
+        .is_err());
+    drop(restarted);
+    let reopened = persistent_store(ledger);
+    assert_eq!(reopened.durable_managed_worktree_closeout(project), None);
+    assert!(reopened
+        .pending_managed_worktree_recovery_bindings()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn native_closeout_recovery_reacquires_only_same_operation_without_unblocking_sessions() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("native-recovery.json");
+    let project = "agent:runner:managed-child";
+    let first = persistent_store(ledger.clone());
+    let session = first.start_session_with_guards(
+        Some(project.into()),
+        Some("finished".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    first.close_session(&session.session_id).unwrap();
+    first.flush_persistence();
+    let admission = first.begin_managed_worktree_cleanup_fence(project).unwrap();
+    admission.persist_managed_closeout("operation-1").unwrap();
+    drop(admission);
+    drop(first);
+
+    let resumed = persistent_store(ledger.clone());
+    assert_eq!(
+        resumed
+            .pending_managed_worktree_recovery_bindings()
+            .unwrap_err(),
+        "durable_closeout_binding_missing"
+    );
+    assert_eq!(
+        resumed
+            .begin_managed_worktree_recovery_fence(project, "operation-2")
+            .err()
+            .unwrap(),
+        "durable_closeout_operation_conflict"
+    );
+    let recovered = resumed
+        .begin_managed_worktree_recovery_fence(project, "operation-1")
+        .expect("exact previous owner recovers");
+    assert_eq!(
+        resumed
+            .begin_managed_worktree_recovery_fence(project, "operation-1")
+            .err()
+            .unwrap(),
+        "native_closeout_recovery_already_in_progress"
+    );
+    assert!(resumed
+        .start_session_with_options(crate::SessionCreateOptions::new(
+            Some(project.into()),
+            Some("blocked during recovery".into()),
+            SessionMode::ReadOnly,
+            SessionGuards::default(),
+        ))
+        .is_err());
+    drop(recovered);
+    assert_eq!(
+        resumed.durable_managed_worktree_closeout(project),
+        Some("operation-1".into())
+    );
+    assert!(resumed
+        .start_session_with_options(crate::SessionCreateOptions::new(
+            Some(project.into()),
+            Some("still blocked after crash".into()),
+            SessionMode::ReadOnly,
+            SessionGuards::default(),
+        ))
+        .is_err());
+    let second = resumed
+        .begin_managed_worktree_recovery_fence(project, "operation-1")
+        .expect("same owner may retry after cancellation");
+    drop(second);
+    drop(resumed);
+
+    let restarted = persistent_store(ledger);
+    assert_eq!(
+        restarted.durable_managed_worktree_closeout(project),
+        Some("operation-1".into())
+    );
+    let third = restarted
+        .begin_managed_worktree_recovery_fence(project, "operation-1")
+        .expect("same owner may recover after a second process restart");
+    drop(third);
+    assert_eq!(
+        restarted
+            .begin_managed_worktree_recovery_fence(project, "operation-2")
+            .err()
+            .unwrap(),
+        "durable_closeout_operation_conflict"
+    );
+}
+
+#[test]
+fn native_closeout_terminal_release_requires_exact_durable_cas_and_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("reconcile.json");
+    let project = "agent:runner:managed-child";
+    let first = persistent_store(ledger.clone());
+    let closed = first.start_session_with_guards(
+        Some(project.to_string()),
+        Some("finished".to_string()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    first.close_session(&closed.session_id).unwrap();
+    first.flush_persistence();
+    let fence = first.begin_managed_worktree_cleanup_fence(project).unwrap();
+    fence.persist_managed_closeout("op-123").unwrap();
+    drop(fence);
+    drop(first);
+
+    let resumed = persistent_store(ledger.clone());
+    assert_eq!(
+        resumed
+            .reconcile_durable_managed_closeout_terminal(project, "op-stale")
+            .unwrap_err(),
+        "durable_closeout_operation_conflict"
+    );
+    assert_eq!(
+        resumed.durable_managed_worktree_closeout(project),
+        Some("op-123".into())
+    );
+    assert!(resumed
+        .start_session_with_options(crate::SessionCreateOptions::new(
+            Some(project.into()),
+            Some("must stay blocked".into()),
+            SessionMode::ReadOnly,
+            SessionGuards::default()
+        ))
+        .is_err());
+
+    resumed
+        .reconcile_durable_managed_closeout_terminal(project, "op-123")
+        .unwrap();
+    assert_eq!(resumed.durable_managed_worktree_closeout(project), None);
+    assert_eq!(
+        resumed
+            .reconcile_durable_managed_closeout_terminal(project, "op-123")
+            .unwrap_err(),
+        "durable_closeout_not_reserved"
+    );
+    drop(resumed);
+    let reopened = persistent_store(ledger);
+    assert_eq!(reopened.durable_managed_worktree_closeout(project), None);
+    let next = reopened.start_session_with_guards(
+        Some(project.into()),
+        Some("permitted after trusted reconciliation".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    assert_eq!(next.project.as_deref(), Some(project));
+}
+
+#[test]
+fn native_closeout_held_session_guard_upgrades_durably_without_admission_gap() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("upgrade.json");
+    let store = persistent_store(ledger.clone());
+    let project = "agent:runner:managed-child";
+    let session = store.start_session_with_guards(
+        Some(project.into()),
+        Some("closed session".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    store.close_session(&session.session_id).unwrap();
+    store.flush_persistence();
+    let guard = store.begin_managed_worktree_cleanup_fence(project).unwrap();
+    assert_eq!(guard.persist_managed_closeout("operation-1"), Ok(()));
+    assert_eq!(guard.persist_managed_closeout("operation-1"), Ok(()));
+    assert_eq!(
+        guard.persist_managed_closeout("operation-2").unwrap_err(),
+        "durable_closeout_operation_conflict"
+    );
+    drop(guard);
+    assert_eq!(
+        store.durable_managed_worktree_closeout(project),
+        Some("operation-1".into())
+    );
+    assert!(store
+        .start_session_with_options(crate::SessionCreateOptions::new(
+            Some(project.into()),
+            Some("blocked".into()),
+            SessionMode::ReadOnly,
+            SessionGuards::default()
+        ))
+        .is_err());
+    drop(store);
+    let reopened = persistent_store(ledger);
+    assert_eq!(
+        reopened.durable_managed_worktree_closeout(project),
+        Some("operation-1".into())
+    );
+    assert!(reopened
+        .begin_managed_worktree_cleanup_fence(project)
+        .is_err());
+    assert!(reopened
+        .start_session_with_options(crate::SessionCreateOptions::new(
+            Some(project.into()),
+            Some("blocked on restart".into()),
+            SessionMode::ReadOnly,
+            SessionGuards::default()
+        ))
+        .is_err());
+}
+
+#[test]
+fn native_closeout_durable_reservation_survives_restart_and_blocks_new_sessions() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("managed-closeout.json");
+    let store = persistent_store(ledger.clone());
+    let session = store.start_session_with_guards(
+        Some("agent:runner:managed-child".into()),
+        Some("closeout fixture".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    assert_eq!(
+        store
+            .reserve_durable_managed_worktree_closeout("agent:runner:managed-child", "operation-1")
+            .unwrap_err(),
+        "managed_worktree_active_sessions"
+    );
+    store.close_session(&session.session_id).unwrap();
+    store.flush_persistence();
+    store
+        .reserve_durable_managed_worktree_closeout("agent:runner:managed-child", "operation-1")
+        .unwrap();
+    assert_eq!(
+        store
+            .reserve_durable_managed_worktree_closeout("agent:runner:managed-child", "operation-2")
+            .unwrap_err(),
+        "durable_closeout_operation_conflict"
+    );
+    assert_eq!(
+        store.durable_managed_worktree_closeout("agent:runner:managed-child"),
+        Some("operation-1".into())
+    );
+    drop(store);
+    let restored = persistent_store(ledger);
+    assert_eq!(
+        restored.durable_managed_worktree_closeout("agent:runner:managed-child"),
+        Some("operation-1".into())
+    );
+    assert_eq!(
+        restored
+            .reserve_durable_managed_worktree_closeout("agent:runner:managed-child", "operation-1"),
+        Ok(())
+    );
+    assert_eq!(
+        restored
+            .reserve_durable_managed_worktree_closeout("agent:runner:managed-child", "operation-2")
+            .unwrap_err(),
+        "durable_closeout_operation_conflict"
+    );
+    let outcome = restored.start_session_with_options(crate::SessionCreateOptions::new(
+        Some("agent:runner:managed-child".into()),
+        Some("should not reopen".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    ));
+    assert!(outcome.is_err());
+    let other = restored.start_session_with_guards(
+        Some("agent:runner:unrelated".into()),
+        Some("unrelated".into()),
+        SessionMode::ReadOnly,
+        SessionGuards::default(),
+    );
+    assert_eq!(other.project.as_deref(), Some("agent:runner:unrelated"));
+}
+
+#[test]
 fn ledger_round_trip_preserves_session_state_events_and_messages() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("sessions.json");
@@ -414,6 +853,101 @@ fn retained_project_session_counts_are_exact_and_cover_all_lifecycles() {
         store.retained_project_session_counts("agent:ruoshui:absent"),
         (0, 0)
     );
+}
+
+#[test]
+fn managed_worktree_cleanup_fence_requires_exact_closed_session() {
+    let store = SessionStore::default();
+    let project = "agent:ruoshui:new-managed";
+    assert_eq!(
+        store
+            .begin_managed_worktree_cleanup_fence(project)
+            .err()
+            .as_deref(),
+        Some("managed_worktree_no_closed_sessions")
+    );
+    let foreign = store.start_session(
+        Some("agent:ruoshui:foreign".to_string()),
+        Some("foreign only".to_string()),
+    );
+    store.close_session(&foreign.session_id).unwrap();
+    assert_eq!(
+        store
+            .begin_managed_worktree_cleanup_fence(project)
+            .err()
+            .as_deref(),
+        Some("managed_worktree_no_closed_sessions")
+    );
+    let own = store.start_session(Some(project.to_string()), Some("exact".to_string()));
+    store.close_session(&own.session_id).unwrap();
+    let guard = store
+        .begin_managed_worktree_cleanup_fence(project)
+        .expect("one exact closed Session is required");
+    assert_eq!(store.retained_project_session_counts(project), (0, 1));
+    drop(guard);
+}
+
+#[test]
+fn managed_worktree_cleanup_fence_blocks_active_session_and_racing_creation() {
+    let store = SessionStore::default();
+    let project = "agent:ruoshui:managed-new";
+    let active = store.start_session(
+        Some(project.to_string()),
+        Some("active worktree task".to_string()),
+    );
+    let foreign = store.start_session(
+        Some("agent:ruoshui:unrelated".to_string()),
+        Some("other active task".to_string()),
+    );
+
+    // Unlike ordinary unregister, auto-reclaim must not acquire a fence while
+    // the target still owns a live Session. A rejected attempt must not
+    // permanently block normal Session creation or closure.
+    assert_eq!(
+        store
+            .begin_managed_worktree_cleanup_fence(project)
+            .err()
+            .as_deref(),
+        Some("managed_worktree_active_sessions")
+    );
+    assert_eq!(store.retained_project_session_counts(project), (1, 0));
+    let another = store.start_session(
+        Some(project.to_string()),
+        Some("not fenced after refusal".to_string()),
+    );
+    store.close_session(&active.session_id).unwrap();
+    assert!(store.begin_managed_worktree_cleanup_fence(project).is_err());
+    store.close_session(&another.session_id).unwrap();
+
+    let guard = store
+        .begin_managed_worktree_cleanup_fence(project)
+        .expect("all exact project sessions must be closed");
+    assert_eq!(store.retained_project_session_counts(project), (0, 2));
+    assert_eq!(
+        store.retained_project_session_counts("agent:ruoshui:unrelated"),
+        (1, 0)
+    );
+    assert!(store.begin_project_unregister_fence(project).is_err());
+    let racing = store.start_session_with_options(crate::SessionCreateOptions::new(
+        Some(project.to_string()),
+        Some("racing worktree session".to_string()),
+        SessionMode::Normal,
+        SessionGuards::default(),
+    ));
+    assert_eq!(racing.unwrap_err(), "project_retirement_in_progress");
+    drop(guard);
+
+    // A released cleanup fence must not affect independent active Sessions.
+    let resuming = store.start_session(
+        Some(project.to_string()),
+        Some("reopened after hold".to_string()),
+    );
+    assert_eq!(resuming.lifecycle, SessionLifecycle::Active);
+    assert_eq!(foreign.lifecycle, SessionLifecycle::Active);
+    // Ordinary unregister still deliberately supports historical close/read,
+    // including when a Session remains active.
+    let historical = store.begin_project_unregister_fence(project).unwrap();
+    drop(historical);
 }
 
 #[test]
