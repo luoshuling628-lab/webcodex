@@ -392,6 +392,67 @@ pub(super) fn managed_worktree_local_git_reclaim_gate(
     Ok(())
 }
 
+/// Discover an unambiguous, *fresh* remote recovery binding for one exact
+/// commit. A local branch name or symbolic HEAD is never recovery evidence.
+/// This is an internal read-only source for the protected Native Owner, not a
+/// deletion authorization or a substitute for the Runner's final remote gate.
+#[allow(dead_code)]
+pub(super) fn managed_worktree_unique_remote_recovery(
+    source: &Path,
+    expected_sha: &str,
+) -> Result<(String, String), &'static str> {
+    if !matches!(expected_sha.len(), 40 | 64)
+        || !expected_sha.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err("managed_reclaim_remote_ref_unverified");
+    }
+    let origin = managed_worktree_git_text(source, &["config", "--get", "remote.origin.url"])
+        .map_err(|_| "managed_reclaim_remote_origin_unverified")?;
+    if origin.is_empty() || origin.chars().any(|ch| ch.is_control()) {
+        return Err("managed_reclaim_remote_origin_unverified");
+    }
+    let output = run_git_bounded(
+        source,
+        &["ls-remote", "--refs", "--heads", "origin"],
+        MANAGED_WORKTREE_GIT_TIMEOUT,
+        None,
+    )
+    .map_err(|_| "managed_reclaim_remote_unreachable")?;
+    if !output.status.success() || output.stdout_capped || output.stderr_capped {
+        return Err("managed_reclaim_remote_unreachable");
+    }
+    let stdout =
+        String::from_utf8(output.stdout).map_err(|_| "managed_reclaim_remote_ref_unverified")?;
+    let mut found: Option<&str> = None;
+    for row in stdout.lines() {
+        let (sha, remote_ref) = row
+            .split_once('\t')
+            .ok_or("managed_reclaim_remote_ref_unverified")?;
+        if !matches!(sha.len(), 40 | 64)
+            || !sha.bytes().all(|b| b.is_ascii_hexdigit())
+            || !remote_ref.starts_with("refs/heads/")
+            || remote_ref.len() <= "refs/heads/".len()
+            || remote_ref.contains("..")
+            || remote_ref.ends_with('/')
+            || remote_ref.ends_with(".lock")
+            || !remote_ref
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.'))
+        {
+            return Err("managed_reclaim_remote_ref_unverified");
+        }
+        if sha.eq_ignore_ascii_case(expected_sha) {
+            if found.replace(remote_ref).is_some() {
+                return Err("managed_reclaim_remote_ref_ambiguous");
+            }
+        }
+    }
+    let remote_ref = found.ok_or("managed_reclaim_remote_commit_not_recoverable")?;
+    // The same exact-ref gate is applied again at the destructive boundary.
+    managed_worktree_remote_exact_ref_gate(source, expected_sha, "origin", &origin, remote_ref)?;
+    Ok((origin, remote_ref.to_owned()))
+}
+
 /// Require a fresh, exact remote branch head before disposal. Local tracking
 /// branches and cached Git state are not evidence that a commit survived on
 /// the server. A symbolic HEAD or a tag is deliberately insufficient: the
@@ -604,6 +665,62 @@ mod remote_recoverability_tests {
                 "refs/heads/main"
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn native_reclaim_unique_remote_binding_refuses_missing_and_ambiguous_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir(&source).unwrap();
+        git(tmp.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        git(&source, &["init"]);
+        git(&source, &["config", "user.name", "Fixture"]);
+        git(
+            &source,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        std::fs::write(source.join("tracked.txt"), "one").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "first"]);
+        git(&source, &["branch", "-M", "recovery"]);
+        let sha = git(&source, &["rev-parse", "HEAD"]);
+        git(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        assert_eq!(
+            managed_worktree_unique_remote_recovery(&source, &sha),
+            Err("managed_reclaim_remote_commit_not_recoverable")
+        );
+        git(&source, &["push", "origin", "recovery"]);
+        assert_eq!(
+            managed_worktree_unique_remote_recovery(&source, &sha),
+            Ok((
+                remote.to_str().unwrap().to_owned(),
+                "refs/heads/recovery".into()
+            ))
+        );
+        git(&source, &["push", "origin", "HEAD:refs/heads/duplicate"]);
+        assert_eq!(
+            managed_worktree_unique_remote_recovery(&source, &sha),
+            Err("managed_reclaim_remote_ref_ambiguous")
+        );
+        git(&source, &["push", "origin", ":refs/heads/duplicate"]);
+        std::fs::write(source.join("tracked.txt"), "two").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "second"]);
+        let unpushed = git(&source, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            managed_worktree_unique_remote_recovery(&source, &unpushed),
+            Err("managed_reclaim_remote_commit_not_recoverable")
+        );
+        // A matching branch name alone is never proof of remote recovery.
+        git(&source, &["push", "origin", ":refs/heads/recovery"]);
+        assert_eq!(
+            managed_worktree_unique_remote_recovery(&source, &sha),
+            Err("managed_reclaim_remote_commit_not_recoverable")
         );
     }
 
