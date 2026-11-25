@@ -570,34 +570,30 @@ impl ToolRuntime {
                         }),
                     );
                 }
-                // This exact first-time Closed transition is now durable.
-                // Wake the existing protected Native Owner observation path,
-                // never a deletion route, and never manufacture admin access.
-                // The outcome cannot change the already committed Session close.
-                if !outcome.already_closed
-                    && outcome
-                        .summary
-                        .project
-                        .as_deref()
-                        .is_some_and(|project| project.starts_with("agent:"))
+                // A real durable close and its idempotent replay both recheck
+                // trusted Owner admission. Replay matters if the Server dies
+                // after flushing Closed but before entering the Owner.
+                // Never synthesize admin authority; the current production
+                // Runner does not advertise NativeManagedCloseout, so only
+                // bounded read-only observation runs until release admission.
+                if outcome
+                    .summary
+                    .project
+                    .as_deref()
+                    .is_some_and(|project| project.starts_with("agent:"))
                 {
-                    // An unavailable Runner/Owner must never hold up a
-                    // committed Session close. Timeout cancels observation;
-                    // no mutation/lease is granted by this notification.
-                    let wakeup = tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        crate::admin_project_lifecycle::observe_native_closeout_closed_session(
-                            self,
-                            auth,
-                            outcome.summary.project.as_deref(),
-                        ),
-                    )
-                    .await
-                    .unwrap_or("native_closeout_wakeup_timeout_no_delete");
+                    // Do NOT wrap destructive execution in the short read-only
+                    // observation timeout: cancellation could release Server
+                    // fences before the Runner's terminal receipt is reconciled.
+                    let wakeup = crate::admin_project_lifecycle::execute_native_closeout_from_durable_session_close(
+                        self,
+                        auth,
+                        outcome.summary.project.as_deref(),
+                    ).await;
                     tracing::info!(
                         session_id = %outcome.summary.session_id,
                         wakeup_outcome = wakeup,
-                        "Durable Session close Native Owner observation (no delete)"
+                        "Durable Session close Native Owner admission"
                     );
                 }
                 ToolResult::ok(json!({

@@ -410,6 +410,85 @@ pub(crate) async fn observe_native_closeout_closed_session(
     }
 }
 
+/// Trusted close-session event entry for an already-durable Closed Session.
+/// Neither a generic HTTP mutation nor a delegated machine credential can
+/// invoke the protected Owner. The explicit Runner capability is the
+/// independently reviewed release gate. When absent, retain read-only
+/// observation without issuing any operation or durable delete intent.
+///
+/// A repeated close with the same authenticated admin may retry after a
+/// Server crash between Session flush and this invocation. An existing
+/// durable closeout reservation still rejects any conflicting operation ID.
+pub(crate) async fn execute_native_closeout_from_durable_session_close(
+    runtime: &ToolRuntime,
+    auth: Option<&AuthContext>,
+    project: Option<&str>,
+) -> &'static str {
+    let Some((auth, client_id, project_id, target)) = native_closeout_wakeup_target(auth, project)
+    else {
+        return "native_closeout_wakeup_not_authorized";
+    };
+    let Some(db) = runtime.job_terminal_db.as_ref() else {
+        return "native_closeout_owner_database_unavailable";
+    };
+    let access = crate::runner_http::runner_access_from_auth(Some(auth));
+    let Some(client) = runtime
+        .runner_registry
+        .get_runner_semantic_view_for_auth(&client_id, access.as_ref())
+        .await
+    else {
+        return "native_closeout_wakeup_runner_unavailable";
+    };
+    if !client.supports(RunnerFeature::NativeManagedCloseout) {
+        return tokio::time::timeout(
+            Duration::from_secs(2),
+            observe_native_closeout_closed_session(runtime, Some(auth), Some(target)),
+        )
+        .await
+        .unwrap_or("native_closeout_wakeup_timeout_no_delete");
+    }
+    if !client.view.connected
+        || client.view.status != "online"
+        || !client
+            .view
+            .project_inventory
+            .as_ref()
+            .is_some_and(|inventory| inventory.sync_state == "complete")
+    {
+        return "native_closeout_wakeup_inventory_unverified";
+    }
+    let Some(child) = client
+        .view
+        .projects
+        .iter()
+        .find(|entry| entry.id == project_id)
+    else {
+        return "native_closeout_wakeup_project_not_found";
+    };
+    let Some(revision) = child.revision.as_deref() else {
+        return "native_closeout_wakeup_revision_unverified";
+    };
+    if !native_closeout_owner_identity_ready(child, revision) {
+        return "native_closeout_wakeup_not_managed";
+    }
+    let intent = VerifiedNativeCloseoutIntent {
+        project: target.to_owned(),
+        expected_revision: revision.to_owned(),
+        operation_id: uuid::Uuid::new_v4().to_string(),
+    };
+    let service = AdminProjectLifecycleService::new(Arc::new(runtime.clone()), db.clone());
+    match service.execute_native_closeout_bound(auth, intent).await {
+        Ok(_) => "native_closeout_owner_completed",
+        Err(response) => {
+            tracing::warn!(
+                status = response.status,
+                "Trusted Session close Native Owner admission/execution remains blocked"
+            );
+            "native_closeout_owner_failed_closed"
+        }
+    }
+}
+
 /// Acquire the existing Runner job-start fence and the stronger native
 /// Session closeout fence in that order. A successful return does NOT authorize
 /// unregister or Git deletion. Unlike ordinary Project unregister, the
