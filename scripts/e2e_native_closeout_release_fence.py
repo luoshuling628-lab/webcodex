@@ -54,6 +54,36 @@ class CloseoutFenceSmoke(Acceptance):
         return subprocess.Popen([str(executable), *args], env=env,
                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log)
 
+    def prepare(self):
+        # All Git objects, recovery refs, allowed roots and service credentials
+        # belong to this disposable fixture, never to a production Project.
+        super().prepare()
+        stop(self.runner)
+        self.runner = None
+        config = self.root / "runner.toml"
+        old = "allowed_roots = [" + json.dumps(str(self.project_dir)) + "]"
+        content = config.read_text(encoding="utf-8")
+        check(content.count(old) == 1, "fixture policy binding drifted")
+        config.write_text(content.replace(old, "allowed_roots = [" +
+                          json.dumps(str(self.root)) + "]"), encoding="utf-8")
+        self.git(self.project_dir, "init", "-b", "main")
+        self.git(self.project_dir, "config", "user.name", "Closeout fixture")
+        self.git(self.project_dir, "config", "user.email", "fixture@example.invalid")
+        (self.project_dir / "README.md").write_text("isolated closeout fixture\n")
+        self.git(self.project_dir, "add", "README.md")
+        self.git(self.project_dir, "commit", "-m", "fixture baseline")
+        remote = self.root / "recovery.git"
+        self.git(self.root, "init", "--bare", str(remote))
+        self.git(self.project_dir, "remote", "add", "origin", str(remote))
+        self.git(self.project_dir, "push", "origin", "main")
+        self.runner = self.launch("webcodex-runner", ["--config", str(config)], self.env)
+        self.wait_ready(self.project, self.owner)
+
+    @staticmethod
+    def git(cwd: Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", str(cwd), *args], check=True,
+                              capture_output=True, text=True, timeout=30).stdout.strip()
+
     def probe(self) -> None:
         self.prepare()
         sentinel = self.project_dir / "unique-business-content.txt"
@@ -79,6 +109,28 @@ class CloseoutFenceSmoke(Acceptance):
             check(result.get("success") is True,
                   f"{name} failed: {result}")
             return result["output"]
+
+        # Create a real managed child while the source is clean. The sentinel
+        # is deliberately untracked in the source, so move its creation after
+        # the worktree request and preserve it throughout subsequent restarts.
+        sentinel.unlink()
+        before = self.git(self.project_dir, "worktree", "list", "--porcelain")
+        managed = tool("work_on_project", {
+            "project": self.project, "mode": "worktree", "base_ref": "HEAD",
+            "instruction": "isolated native closeout fixture",
+        })
+        child_session = managed["session_id"]
+        check(managed.get("worktree", {}).get("managed") is True,
+              "fixture did not create a managed worktree")
+        after = self.git(self.project_dir, "worktree", "list", "--porcelain")
+        check(before != after, "managed worktree was not physically created")
+        sentinel.write_text("NEVER_DELETE_UNIQUE_CONTENT\n", encoding="utf-8")
+        child_closed = tool("close_session", {"session_id": child_session})
+        check(child_closed.get("lifecycle") == "closed",
+              "managed child Session did not durably close")
+        check(self.git(self.project_dir, "worktree", "list", "--porcelain") == after,
+              "unadmitted Runner removed a managed worktree")
+        print("PASS: real managed worktree close preserved release fence")
 
         started = tool("start_session", {
             "project": self.project,
