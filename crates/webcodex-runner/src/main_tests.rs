@@ -1746,9 +1746,16 @@ fn managed_worktree_slug_collision_escalates_and_unknown_identity_fails_closed()
     ));
     let mut project =
         parse_runner_project_toml(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    // Establish a different exact operation occupying this short slug.
-    project.managed_operation_id = Some("22222222-2222-4222-8222-222222222222".into());
+    // Tampering with a completed operation must never authorize retargeting.
+    project.managed_operation_id = Some("11111111-2222-4222-8222-222222222222".into());
     std::fs::write(&config_path, toml::to_string(&project).unwrap()).unwrap();
+    assert_eq!(
+        project_err(handle_prepare_managed_worktree(&policy, &registry, &request)),
+        "managed_worktree_recovery_conflict"
+    );
+    // Model a legacy registration predating durable completion receipts.
+    // The distinct operation shares the eight-character slug prefix.
+    std::fs::remove_file(registry.join(format!(".managed-materialization-{operation}.done"))).unwrap();
     let second = project_ok(handle_prepare_managed_worktree(
         &policy, &registry, &request,
     ));
