@@ -364,10 +364,25 @@ pub(super) fn run_git_bounded_with_program(
     timeout: Duration,
     shutdown: Option<&AtomicBool>,
 ) -> Result<BoundedGitOutput, String> {
+    run_git_bounded_with_index(program, path, args, timeout, shutdown, None)
+}
+
+/// Private index override is scoped to this child, never the Runner environment.
+pub(super) fn run_git_bounded_with_index(
+    program: &str,
+    path: &Path,
+    args: &[&str],
+    timeout: Duration,
+    shutdown: Option<&AtomicBool>,
+    index: Option<&Path>,
+) -> Result<BoundedGitOutput, String> {
     if shutdown.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
         return Err("git stopped during runner shutdown".to_string());
     }
     let mut command = Command::new(program);
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
     command
         .args(args)
         .current_dir(path)
