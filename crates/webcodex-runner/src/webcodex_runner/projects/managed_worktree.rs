@@ -23,6 +23,7 @@ use super::{project_registry_write_lock, structured_project_error_cmd, RunnerPro
 use crate::webcodex_runner::output::{ok_cmd, CommandResult};
 
 const MANAGED_WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(20);
+const MANAGED_WORKTREE_CHECKOUT_TIMEOUT: Duration = Duration::from_secs(300);
 const MANAGED_WORKTREE_NAMESPACE: &str = ".webcodex-worktrees";
 
 /// The slug is routing text, not recovery identity. Only a registered exact
@@ -96,6 +97,48 @@ fn managed_worktree_git_text(path: &Path, args: &[&str]) -> Result<String, &'sta
     String::from_utf8(output.stdout)
         .map(|value| value.trim().to_string())
         .map_err(|_| "worktree_git_failed")
+}
+
+// Only invoked for a newly allocated, not yet registered destination.
+fn materialize_new_worktree(path: &Path, base_sha: &str) -> Result<(), &'static str> {
+    if managed_worktree_git_text(path, &["rev-parse", "HEAD"])? != base_sha {
+        return Err("managed_worktree_recovery_conflict");
+    }
+    // Do not remove index.lock or overwrite an existing user's workspace.
+    // The creation transaction owns this destination; Git retains its own lock.
+    let output = run_git_bounded(
+        path,
+        &["-c", "core.longpaths=true", "read-tree", "--reset", "-u", base_sha],
+        MANAGED_WORKTREE_CHECKOUT_TIMEOUT,
+        None,
+    )
+    .map_err(|_| "worktree_materialization_failed")?;
+    if !output.status.success() {
+        return Err("worktree_materialization_failed");
+    }
+    verify_new_worktree_materialization(path, base_sha)
+}
+
+fn verify_new_worktree_materialization(path: &Path, base_sha: &str) -> Result<(), &'static str> {
+    if managed_worktree_git_text(path, &["rev-parse", "HEAD"])? != base_sha {
+        return Err("managed_worktree_recovery_conflict");
+    }
+    let expected = managed_worktree_git_text(path, &["rev-parse", "HEAD^{tree}"])?;
+    let actual = managed_worktree_git_text(path, &["write-tree"])?;
+    if actual != expected {
+        return Err("worktree_materialization_failed");
+    }
+    let status = run_git_bounded(
+        path,
+        &["-c", "core.longpaths=true", "status", "--porcelain=v1", "--untracked-files=all"],
+        MANAGED_WORKTREE_CHECKOUT_TIMEOUT,
+        None,
+    )
+    .map_err(|_| "worktree_materialization_failed")?;
+    if !status.status.success() || status.stdout_capped || status.stderr_capped || !status.stdout.is_empty() {
+        return Err("worktree_materialization_failed");
+    }
+    Ok(())
 }
 
 fn exact_git_commit(source: &Path, base_ref: &str) -> Result<String, &'static str> {
@@ -975,6 +1018,7 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
                 "worktree",
                 "add",
                 "--detach",
+                "--no-checkout",
                 destination_string.as_str(),
                 base_sha.as_str(),
             ],
@@ -1031,7 +1075,14 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
                     ),
                 };
             }
-            Ok(_) | Err(_) => {}
+            Ok(_) | Err(_) => {
+                // An uncertain add is not a successful creation, even if
+                // HEAD and the linked-worktree metadata already exist.
+                return managed_worktree_error(
+                    start, "operation_indeterminate", true,
+                    Some(&base_ref), Some(&base_sha), Some(source_dirty),
+                );
+            }
         }
         let worktree = match canonicalize_existing(&destination) {
             Ok(worktree) => worktree,
@@ -1080,6 +1131,20 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
                 Some(&base_ref),
                 Some(&base_sha),
                 Some(source_dirty),
+            );
+        }
+        if worktree.parent().is_none_or(|parent| !paths_equal(parent, &managed_root))
+            || validate_project_path_policy(policy, &worktree).is_err()
+        {
+            return managed_worktree_error(
+                start, "managed_worktree_root_unsafe", true,
+                Some(&base_ref), Some(&base_sha), Some(source_dirty),
+            );
+        }
+        if let Err(error) = materialize_new_worktree(&worktree, &base_sha) {
+            return managed_worktree_error(
+                start, error, true,
+                Some(&base_ref), Some(&base_sha), Some(source_dirty),
             );
         }
         worktree
@@ -1241,4 +1306,37 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
         true,
         true,
     )
+}
+
+#[cfg(test)]
+mod materialization_tests {
+    use super::*;
+
+    fn git(path: &Path, args: &[&str]) -> String {
+        managed_worktree_git_text(path, args).expect("fixture git")
+    }
+
+    #[test]
+    fn fresh_no_checkout_materializes_exact_tree_and_preserves_source() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        std::fs::create_dir(&source).unwrap();
+        git(&source, &["init"]);
+        git(&source, &["config", "user.name", "Fixture"]);
+        git(&source, &["config", "user.email", "fixture@example.invalid"]);
+        std::fs::write(source.join("tracked.txt"), "committed").unwrap();
+        git(&source, &["add", "tracked.txt"]);
+        git(&source, &["commit", "-m", "fixture"]);
+        let head = git(&source, &["rev-parse", "HEAD"]);
+        std::fs::write(source.join("tracked.txt"), "user edit").unwrap();
+        let target_arg = managed_worktree_git_cli_path(&target);
+        git(&source, &["worktree", "add", "--detach", "--no-checkout", &target_arg, &head]);
+        assert!(verify_new_worktree_materialization(&target, &head).is_err());
+        materialize_new_worktree(&target, &head).unwrap();
+        assert_eq!(std::fs::read_to_string(target.join("tracked.txt")).unwrap(), "committed");
+        assert_eq!(std::fs::read_to_string(source.join("tracked.txt")).unwrap(), "user edit");
+        std::fs::remove_file(target.join("tracked.txt")).unwrap();
+        assert!(verify_new_worktree_materialization(&target, &head).is_err());
+    }
 }
