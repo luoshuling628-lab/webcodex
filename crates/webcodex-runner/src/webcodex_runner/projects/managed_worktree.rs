@@ -191,17 +191,17 @@ fn resume_pending_materialization(path: &Path, base_sha: &str) -> Result<(), &'s
             "git", path, args, MANAGED_WORKTREE_CHECKOUT_TIMEOUT, None, Some(&private_git_index),
         ).map_err(|_| "worktree_materialization_failed")
     };
-    let output = run(&["read-tree", base_sha])?;
+    let output = run(&["read-tree", base_sha]).map_err(|e| { eprintln!("materialize read-tree: {e}"); "worktree_materialization_failed" })?;
     if !output.status.success() || output.stdout_capped || output.stderr_capped {
         return Err("worktree_materialization_failed");
     }
-    let output = run(&["write-tree"])?;
+    let output = run(&["write-tree"]).map_err(|e| { eprintln!("materialize write-tree: {e}"); "worktree_materialization_failed" })?;
     if !output.status.success() || output.stdout_capped || output.stderr_capped
         || String::from_utf8_lossy(&output.stdout).trim() != expected {
         return Err("worktree_materialization_failed");
     }
     // Without --force Git does not overwrite files left by earlier attempts.
-    let output = run(&["-c", "core.longpaths=true", "checkout-index", "--all"])?;
+    let output = run(&["-c", "core.longpaths=true", "checkout-index", "--all"]).map_err(|e| { eprintln!("materialize checkout-index: {e}"); "worktree_materialization_failed" })?;
     if output.stdout_capped || output.stderr_capped {
         return Err("worktree_materialization_failed");
     }
