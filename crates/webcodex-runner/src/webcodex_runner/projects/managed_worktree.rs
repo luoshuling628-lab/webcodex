@@ -76,8 +76,8 @@ fn choose_managed_destination(
 }
 
 // Stored outside the checkout, in the Runner's existing registry directory.
-// A receipt is consumed before registration: a crash at that boundary fails
-// closed rather than allowing a retired project to be resurrected.
+// Keep the receipt until a durable registry readback. An independently durable
+// completion fence prevents an old receipt from authorizing resurrection.
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct PendingMaterialization {
     operation_id: String,
@@ -86,6 +86,38 @@ struct PendingMaterialization {
     source_root_fingerprint: String,
     base_sha: String,
     destination: PathBuf,
+}
+
+fn completed_receipt_path(registry: &Path, operation_id: &str) -> PathBuf {
+    registry.join(format!(".managed-materialization-{operation_id}.done"))
+}
+
+// Publication and completion both use the existing registry's durability
+// primitive. A hard link publishes a complete immutable receipt without
+// overwriting a competing operation.
+fn publish_receipt_bytes(path: &Path, bytes: &[u8]) -> Result<(), &'static str> {
+    use std::io::Write;
+    let parent = path.parent().ok_or("worktree_registration_failed")?;
+    let temp = parent.join(format!(".materialization-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::hard_link(&temp, path)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&temp);
+    result.map_err(|_| "worktree_registration_failed")?;
+    super::registration::sync_dir(parent).map_err(|_| "operation_indeterminate")
+}
+
+fn mark_materialization_completed(path: &Path, receipt: &PendingMaterialization) -> Result<(), &'static str> {
+    if let Some(existing) = read_pending_receipt(path)? {
+        return if &existing == receipt { Ok(()) } else { Err("managed_worktree_recovery_conflict") };
+    }
+    let bytes = serde_json::to_vec(receipt).map_err(|_| "worktree_registration_failed")?;
+    publish_receipt_bytes(path, &bytes)
 }
 
 fn pending_receipt_path(registry: &Path, operation_id: &str) -> PathBuf {
@@ -108,15 +140,8 @@ fn read_pending_receipt(path: &Path) -> Result<Option<PendingMaterialization>, &
 }
 
 fn persist_pending_receipt(path: &Path, receipt: &PendingMaterialization) -> Result<(), &'static str> {
-    use std::io::Write;
     let bytes = serde_json::to_vec(receipt).map_err(|_| "worktree_registration_failed")?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|_| "worktree_registration_failed")?;
-    file.write_all(&bytes).and_then(|_| file.sync_all())
-        .map_err(|_| "worktree_registration_failed")
+    publish_receipt_bytes(path, &bytes)
 }
 
 // Recover without force: preserve existing bytes and refuse nonempty,
@@ -1011,6 +1036,11 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
         }
     };
     let receipt_path = pending_receipt_path(project_registry_dir, operation_id);
+    let completed_path = completed_receipt_path(project_registry_dir, operation_id);
+    let completed = match read_pending_receipt(&completed_path) {
+        Ok(receipt) => receipt,
+        Err(error) => return managed_worktree_error(start, error, false, Some(&base_ref), Some(&base_sha), Some(source_dirty)),
+    };
     let pending = match read_pending_receipt(&receipt_path) {
         Ok(pending) => pending,
         Err(error) => return managed_worktree_error(start, error, false, Some(&base_ref), Some(&base_sha), Some(source_dirty)),
@@ -1026,7 +1056,7 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
     let destination =
         match load_project_files_for_path_resolution(project_registry_dir).and_then(|projects| {
             choose_managed_destination(&managed_root, &source_root, operation_id, &projects,
-                pending.as_ref().map(|receipt| receipt.destination.as_path()))
+                if completed.is_none() { pending.as_ref().map(|receipt| receipt.destination.as_path()) } else { None })
         }) {
             Ok(path) => path,
             Err(error) => {
@@ -1041,6 +1071,9 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
             }
         };
     if pending.as_ref().is_some_and(|receipt| receipt.destination != destination) {
+        return managed_worktree_error(start, "managed_worktree_recovery_conflict", false, Some(&base_ref), Some(&base_sha), Some(source_dirty));
+    }
+    if completed.is_some() && !destination.exists() {
         return managed_worktree_error(start, "managed_worktree_recovery_conflict", false, Some(&base_ref), Some(&base_sha), Some(source_dirty));
     }
     let mut created_worktree = false;
@@ -1323,6 +1356,14 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
                 Some(source_dirty),
             );
         }
+        if let Some(receipt) = pending.as_ref() {
+            if let Err(error) = mark_materialization_completed(&completed_path, receipt) {
+                return managed_worktree_error(start, error, true, Some(&base_ref), Some(&base_sha), Some(source_dirty));
+            }
+            if std::fs::remove_file(&receipt_path).is_err() {
+                return managed_worktree_error(start, "operation_indeterminate", true, Some(&base_ref), Some(&base_sha), Some(source_dirty));
+            }
+        }
         return managed_worktree_success(
             start,
             client_id,
@@ -1382,9 +1423,8 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
         &base_sha,
         operation_id,
     );
-    if std::fs::remove_file(&receipt_path).is_err() {
-        return managed_worktree_error(start, "operation_indeterminate", true, Some(&base_ref), Some(&base_sha), Some(source_dirty));
-    }
+    // Retain pending ownership across pre-publication failures. Never report
+    // success until registry readback and the completion fence are durable.
     match write_project_toml_atomic(project_registry_dir, &project_id, &content, false) {
         Ok(_) => {}
         Err(ProjectTomlWriteError::BeforeRename) => {
@@ -1408,7 +1448,21 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
             )
         }
     }
-    let project = match parse_runner_project_toml(&content) {
+    let persisted = match std::fs::read_to_string(project_registry_dir.join(format!("{project_id}.toml"))) {
+        Ok(value) if value == content => value,
+        _ => return managed_worktree_error(start, "operation_indeterminate", true, Some(&base_ref), Some(&base_sha), Some(source_dirty)),
+    };
+    let receipt = match read_pending_receipt(&receipt_path) {
+        Ok(Some(receipt)) => receipt,
+        _ => return managed_worktree_error(start, "operation_indeterminate", true, Some(&base_ref), Some(&base_sha), Some(source_dirty)),
+    };
+    if let Err(error) = mark_materialization_completed(&completed_path, &receipt) {
+        return managed_worktree_error(start, error, true, Some(&base_ref), Some(&base_sha), Some(source_dirty));
+    }
+    if std::fs::remove_file(&receipt_path).is_err() {
+        return managed_worktree_error(start, "operation_indeterminate", true, Some(&base_ref), Some(&base_sha), Some(source_dirty));
+    }
+    let project = match parse_runner_project_toml(&persisted) {
         Ok(project) => project,
         Err(_) => {
             return managed_worktree_error(
