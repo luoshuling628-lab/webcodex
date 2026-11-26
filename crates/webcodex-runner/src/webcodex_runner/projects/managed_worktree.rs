@@ -26,13 +26,14 @@ const MANAGED_WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(20);
 const MANAGED_WORKTREE_CHECKOUT_TIMEOUT: Duration = Duration::from_secs(300);
 const MANAGED_WORKTREE_NAMESPACE: &str = ".webcodex-worktrees";
 
-/// The slug is routing text, not recovery identity. Only a registered exact
-/// operation establishes whether an occupied path is ours or a collision.
+/// The slug is routing text, not recovery identity. Only an exact registry
+/// record or an unconsumed creation receipt may establish ownership.
 fn choose_managed_destination(
     root: &Path,
     source: &Path,
     operation_id: &str,
     projects: &[RunnerProjectFile],
+    pending_destination: Option<&Path>,
 ) -> Result<PathBuf, &'static str> {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
@@ -53,6 +54,12 @@ fn choose_managed_destination(
         let existing =
             canonicalize_existing(&candidate).map_err(|_| "managed_worktree_recovery_conflict")?;
         let matches = projects_matching_canonical_path(projects, &existing);
+        if matches.is_empty()
+            && pending_destination.is_some_and(|pending| paths_equal(pending, &existing))
+            && paths_equal(&existing, &candidate)
+        {
+            return Ok(candidate);
+        }
         let [project] = matches.as_slice() else {
             return Err("managed_worktree_recovery_conflict");
         };
@@ -66,6 +73,87 @@ fn choose_managed_destination(
         }
     }
     Err("managed_worktree_recovery_conflict")
+}
+
+// Stored outside the checkout, in the Runner's existing registry directory.
+// A receipt is consumed before registration: a crash at that boundary fails
+// closed rather than allowing a retired project to be resurrected.
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct PendingMaterialization {
+    operation_id: String,
+    source: PathBuf,
+    source_project_id: String,
+    source_root_fingerprint: String,
+    base_sha: String,
+    destination: PathBuf,
+}
+
+fn pending_receipt_path(registry: &Path, operation_id: &str) -> PathBuf {
+    registry.join(format!(".managed-materialization-{operation_id}.json"))
+}
+
+fn read_pending_receipt(path: &Path) -> Result<Option<PendingMaterialization>, &'static str> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("managed_worktree_recovery_conflict"),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 16384 {
+        return Err("managed_worktree_recovery_conflict");
+    }
+    let content = std::fs::read(path).map_err(|_| "managed_worktree_recovery_conflict")?;
+    serde_json::from_slice(&content)
+        .map(Some)
+        .map_err(|_| "managed_worktree_recovery_conflict")
+}
+
+fn persist_pending_receipt(path: &Path, receipt: &PendingMaterialization) -> Result<(), &'static str> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec(receipt).map_err(|_| "worktree_registration_failed")?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| "worktree_registration_failed")?;
+    file.write_all(&bytes).and_then(|_| file.sync_all())
+        .map_err(|_| "worktree_registration_failed")
+}
+
+// Recover without force: preserve existing bytes and refuse nonempty,
+// divergent indexes. Git itself arbitrates index.lock; never unlink it.
+fn resume_pending_materialization(path: &Path, base_sha: &str) -> Result<(), &'static str> {
+    if managed_worktree_git_text(path, &["rev-parse", "HEAD"])? != base_sha {
+        return Err("managed_worktree_recovery_conflict");
+    }
+    if verify_new_worktree_materialization(path, base_sha).is_ok() {
+        return Ok(());
+    }
+    let expected = managed_worktree_git_text(path, &["rev-parse", "HEAD^{tree}"])?;
+    let entries = run_git_bounded(path, &["ls-files", "-z"], MANAGED_WORKTREE_CHECKOUT_TIMEOUT, None)
+        .map_err(|_| "worktree_materialization_failed")?;
+    if !entries.status.success() || entries.stderr_capped {
+        return Err("worktree_materialization_failed");
+    }
+    if entries.stdout.is_empty() && !entries.stdout_capped {
+        let output = run_git_bounded(path, &["read-tree", base_sha], MANAGED_WORKTREE_CHECKOUT_TIMEOUT, None)
+            .map_err(|_| "worktree_materialization_failed")?;
+        if !output.status.success() {
+            return Err("worktree_materialization_failed");
+        }
+    } else if managed_worktree_git_text(path, &["write-tree"])? != expected {
+        return Err("managed_worktree_recovery_conflict");
+    }
+    // checkout-index --all without --force cannot overwrite existing files.
+    let output = run_git_bounded(
+        path, &["-c", "core.longpaths=true", "checkout-index", "--all"],
+        MANAGED_WORKTREE_CHECKOUT_TIMEOUT, None,
+    ).map_err(|_| "worktree_materialization_failed")?;
+    // Existing files may produce a nonzero exit. Only exact final verification
+    // can convert that outcome into success; a timed-out process never can.
+    if output.stdout_capped || output.stderr_capped {
+        return Err("worktree_materialization_failed");
+    }
+    verify_new_worktree_materialization(path, base_sha)
 }
 
 fn managed_worktree_error(
@@ -922,9 +1010,23 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
             )
         }
     };
+    let receipt_path = pending_receipt_path(project_registry_dir, operation_id);
+    let pending = match read_pending_receipt(&receipt_path) {
+        Ok(pending) => pending,
+        Err(error) => return managed_worktree_error(start, error, false, Some(&base_ref), Some(&base_sha), Some(source_dirty)),
+    };
+    if pending.as_ref().is_some_and(|receipt| {
+        receipt.operation_id != operation_id || receipt.source != source_root
+            || receipt.source_project_id != source_project_id
+            || receipt.source_root_fingerprint != source_root_fingerprint
+            || receipt.base_sha != base_sha
+    }) {
+        return managed_worktree_error(start, "managed_worktree_recovery_conflict", false, Some(&base_ref), Some(&base_sha), Some(source_dirty));
+    }
     let destination =
         match load_project_files_for_path_resolution(project_registry_dir).and_then(|projects| {
-            choose_managed_destination(&managed_root, &source_root, operation_id, &projects)
+            choose_managed_destination(&managed_root, &source_root, operation_id, &projects,
+                pending.as_ref().map(|receipt| receipt.destination.as_path()))
         }) {
             Ok(path) => path,
             Err(error) => {
@@ -938,6 +1040,9 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
                 )
             }
         };
+    if pending.as_ref().is_some_and(|receipt| receipt.destination != destination) {
+        return managed_worktree_error(start, "managed_worktree_recovery_conflict", false, Some(&base_ref), Some(&base_sha), Some(source_dirty));
+    }
     let mut created_worktree = false;
     let canonical_worktree = if destination.exists() {
         let Ok(existing) = canonicalize_existing(&destination) else {
@@ -1009,6 +1114,19 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
                     Some(&base_sha),
                     Some(source_dirty),
                 )
+            }
+        }
+        if pending.is_none() {
+            let receipt = PendingMaterialization {
+                operation_id: operation_id.to_owned(),
+                source: source_root.clone(),
+                source_project_id: source_project_id.clone(),
+                source_root_fingerprint: source_root_fingerprint.clone(),
+                base_sha: base_sha.clone(),
+                destination: destination.clone(),
+            };
+            if let Err(error) = persist_pending_receipt(&receipt_path, &receipt) {
+                return managed_worktree_error(start, error, false, Some(&base_ref), Some(&base_sha), Some(source_dirty));
             }
         }
         let destination_string = managed_worktree_git_cli_path(&destination);
@@ -1218,6 +1336,16 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
             false,
         );
     }
+    // No registered project matched. Recovery is permitted only by a
+    // previously persisted, exact creation receipt and the current root policy.
+    if !created_worktree {
+        if pending.is_none() {
+            return managed_worktree_error(start, "managed_worktree_recovery_conflict", true, Some(&base_ref), Some(&base_sha), Some(source_dirty));
+        }
+        if let Err(error) = resume_pending_materialization(&canonical_worktree, &base_sha) {
+            return managed_worktree_error(start, error, true, Some(&base_ref), Some(&base_sha), Some(source_dirty));
+        }
+    }
     let project_id =
         match choose_auto_project_id(project_registry_dir, &projects, &canonical_worktree) {
             Ok(id) => id,
@@ -1254,6 +1382,9 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
         &base_sha,
         operation_id,
     );
+    if std::fs::remove_file(&receipt_path).is_err() {
+        return managed_worktree_error(start, "operation_indeterminate", true, Some(&base_ref), Some(&base_sha), Some(source_dirty));
+    }
     match write_project_toml_atomic(project_registry_dir, &project_id, &content, false) {
         Ok(_) => {}
         Err(ProjectTomlWriteError::BeforeRename) => {
@@ -1333,10 +1464,22 @@ mod materialization_tests {
         let target_arg = managed_worktree_git_cli_path(&target);
         git(&source, &["worktree", "add", "--detach", "--no-checkout", &target_arg, &head]);
         assert!(verify_new_worktree_materialization(&target, &head).is_err());
-        materialize_new_worktree(&target, &head).unwrap();
+        // Simulate interruption after the no-checkout allocation. An existing
+        // lock must be preserved. Only after release can exact recovery resume.
+        let git_dir = git(&target, &["rev-parse", "--absolute-git-dir"]);
+        let lock = Path::new(&git_dir).join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+        assert!(resume_pending_materialization(&target, &head).is_err());
+        assert!(lock.exists());
+        std::fs::remove_file(&lock).unwrap();
+        resume_pending_materialization(&target, &head).unwrap();
         assert_eq!(std::fs::read_to_string(target.join("tracked.txt")).unwrap(), "committed");
         assert_eq!(std::fs::read_to_string(source.join("tracked.txt")).unwrap(), "user edit");
         std::fs::remove_file(target.join("tracked.txt")).unwrap();
         assert!(verify_new_worktree_materialization(&target, &head).is_err());
+        resume_pending_materialization(&target, &head).unwrap();
+        std::fs::write(target.join("tracked.txt"), "unexpected edit").unwrap();
+        assert!(resume_pending_materialization(&target, &head).is_err());
+        assert_eq!(std::fs::read_to_string(target.join("tracked.txt")).unwrap(), "unexpected edit");
     }
 }
