@@ -216,7 +216,8 @@ fn resume_pending_materialization(path: &Path, base_sha: &str) -> Result<(), &'s
     if !has_index {
         // Atomic no-replace publication. No ordinary index.lock is created
         // by the materialization transaction, even if the Runner crashes.
-        std::fs::File::open(&private_index).and_then(|file| file.sync_all())
+        std::fs::OpenOptions::new().write(true).open(&private_index)
+            .and_then(|file| file.sync_all())
             .map_err(|e| { eprintln!("materialize fsync private index: {e}"); "worktree_materialization_failed" })?;
         std::fs::hard_link(&private_index, &index)
             .map_err(|e| { eprintln!("materialize publish index: {e}"); "managed_worktree_recovery_conflict" })?;
