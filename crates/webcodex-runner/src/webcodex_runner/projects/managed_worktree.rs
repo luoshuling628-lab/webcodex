@@ -146,41 +146,87 @@ fn persist_pending_receipt(path: &Path, receipt: &PendingMaterialization) -> Res
     publish_receipt_bytes(path, &bytes)
 }
 
-// Recover without force: preserve existing bytes and refuse nonempty,
-// divergent indexes. Git itself arbitrates index.lock; never unlink it.
+// Materialize an unregistered worktree using a fresh, private Git index.
+// Interrupted private indexes (and their locks) never block a later attempt.
+// An unknown ordinary index.lock is not ours to remove. Never overwrite an
+// existing index or working file, even when an external writer races us.
 fn resume_pending_materialization(path: &Path, base_sha: &str) -> Result<(), &'static str> {
     if managed_worktree_git_text(path, &["rev-parse", "HEAD"])? != base_sha {
         return Err("managed_worktree_recovery_conflict");
     }
-    if verify_new_worktree_materialization(path, base_sha).is_ok() {
+    let git_dir_text = managed_worktree_git_text(path, &["rev-parse", "--absolute-git-dir"])?;
+    let git_dir = canonicalize_existing(Path::new(&git_dir_text))
+        .map_err(|_| "managed_worktree_recovery_conflict")?;
+    let index = git_dir.join("index");
+    let lock = git_dir.join("index.lock");
+    let ensure_unlocked = || match std::fs::symlink_metadata(&lock) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err("managed_worktree_recovery_conflict"),
+    };
+    ensure_unlocked()?;
+    let expected = managed_worktree_git_text(path, &["rev-parse", "HEAD^{tree}"])?;
+    // New no-checkout allocations normally have no index. A pre-existing
+    // index must already represent the exact expected tree; never replace it.
+    let has_index = match std::fs::symlink_metadata(&index) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+            if managed_worktree_git_text(path, &["write-tree"])? != expected {
+                return Err("managed_worktree_recovery_conflict");
+            }
+            true
+        }
+        _ => return Err("managed_worktree_recovery_conflict"),
+    };
+    if has_index && verify_new_worktree_materialization(path, base_sha).is_ok() {
         return Ok(());
     }
-    let expected = managed_worktree_git_text(path, &["rev-parse", "HEAD^{tree}"])?;
-    let entries = run_git_bounded(path, &["ls-files", "-z"], MANAGED_WORKTREE_CHECKOUT_TIMEOUT, None)
-        .map_err(|_| "worktree_materialization_failed")?;
-    if !entries.status.success() || entries.stderr_capped {
+    // Reserve an exclusive private directory, so no prior interrupted attempt
+    // can leave a lock at the index path used by this attempt.
+    let attempt = git_dir.join(format!("webcodex-materialization-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&attempt).map_err(|_| "worktree_materialization_failed")?;
+    let private_index = attempt.join("index");
+    let run = |args: &[&str]| {
+        super::catalog::run_git_bounded_with_index(
+            "git", path, args, MANAGED_WORKTREE_CHECKOUT_TIMEOUT, None, Some(&private_index),
+        ).map_err(|_| "worktree_materialization_failed")
+    };
+    let output = run(&["read-tree", base_sha])?;
+    if !output.status.success() || output.stdout_capped || output.stderr_capped {
         return Err("worktree_materialization_failed");
     }
-    if entries.stdout.is_empty() && !entries.stdout_capped {
-        let output = run_git_bounded(path, &["read-tree", base_sha], MANAGED_WORKTREE_CHECKOUT_TIMEOUT, None)
-            .map_err(|_| "worktree_materialization_failed")?;
-        if !output.status.success() {
-            return Err("worktree_materialization_failed");
-        }
-    } else if managed_worktree_git_text(path, &["write-tree"])? != expected {
-        return Err("managed_worktree_recovery_conflict");
+    let output = run(&["write-tree"])?;
+    if !output.status.success() || output.stdout_capped || output.stderr_capped
+        || String::from_utf8_lossy(&output.stdout).trim() != expected {
+        return Err("worktree_materialization_failed");
     }
-    // checkout-index --all without --force cannot overwrite existing files.
-    let output = run_git_bounded(
-        path, &["-c", "core.longpaths=true", "checkout-index", "--all"],
-        MANAGED_WORKTREE_CHECKOUT_TIMEOUT, None,
-    ).map_err(|_| "worktree_materialization_failed")?;
-    // Existing files may produce a nonzero exit. Only exact final verification
-    // can convert that outcome into success; a timed-out process never can.
+    // Without --force Git does not overwrite files left by earlier attempts.
+    let output = run(&["-c", "core.longpaths=true", "checkout-index", "--all"])?;
     if output.stdout_capped || output.stderr_capped {
         return Err("worktree_materialization_failed");
     }
-    verify_new_worktree_materialization(path, base_sha)
+    let output = run(&["--no-optional-locks", "-c", "core.longpaths=true", "status",
+        "--porcelain=v1", "--untracked-files=all"])?;
+    if !output.status.success() || output.stdout_capped || output.stderr_capped
+        || !output.stdout.is_empty() {
+        return Err("worktree_materialization_failed");
+    }
+    ensure_unlocked()?;
+    if !has_index {
+        // Atomic no-replace publication. No ordinary index.lock is created
+        // by the materialization transaction, even if the Runner crashes.
+        std::fs::File::open(&private_index).and_then(|file| file.sync_all())
+            .map_err(|_| "worktree_materialization_failed")?;
+        std::fs::hard_link(&private_index, &index)
+            .map_err(|_| "managed_worktree_recovery_conflict")?;
+        super::registration::sync_dir(&git_dir).map_err(|_| "operation_indeterminate")?;
+    }
+    ensure_unlocked()?;
+    verify_new_worktree_materialization(path, base_sha)?;
+    // Delete only this attempt's known file after successful verification.
+    // Earlier private attempts are not deleted without lifecycle evidence.
+    let _ = std::fs::remove_file(&private_index);
+    let _ = std::fs::remove_dir(&attempt);
+    Ok(())
 }
 
 fn managed_worktree_error(
@@ -214,24 +260,9 @@ fn managed_worktree_git_text(path: &Path, args: &[&str]) -> Result<String, &'sta
         .map_err(|_| "worktree_git_failed")
 }
 
-// Only invoked for a newly allocated, not yet registered destination.
+// Fresh allocation and interrupted recovery use the same no-overwrite path.
 fn materialize_new_worktree(path: &Path, base_sha: &str) -> Result<(), &'static str> {
-    if managed_worktree_git_text(path, &["rev-parse", "HEAD"])? != base_sha {
-        return Err("managed_worktree_recovery_conflict");
-    }
-    // Do not remove index.lock or overwrite an existing user's workspace.
-    // The creation transaction owns this destination; Git retains its own lock.
-    let output = run_git_bounded(
-        path,
-        &["-c", "core.longpaths=true", "read-tree", "--reset", "-u", base_sha],
-        MANAGED_WORKTREE_CHECKOUT_TIMEOUT,
-        None,
-    )
-    .map_err(|_| "worktree_materialization_failed")?;
-    if !output.status.success() {
-        return Err("worktree_materialization_failed");
-    }
-    verify_new_worktree_materialization(path, base_sha)
+    resume_pending_materialization(path, base_sha)
 }
 
 fn verify_new_worktree_materialization(path: &Path, base_sha: &str) -> Result<(), &'static str> {
@@ -245,7 +276,7 @@ fn verify_new_worktree_materialization(path: &Path, base_sha: &str) -> Result<()
     }
     let status = run_git_bounded(
         path,
-        &["-c", "core.longpaths=true", "status", "--porcelain=v1", "--untracked-files=all"],
+        &["--no-optional-locks", "-c", "core.longpaths=true", "status", "--porcelain=v1", "--untracked-files=all"],
         MANAGED_WORKTREE_CHECKOUT_TIMEOUT,
         None,
     )
@@ -1528,7 +1559,13 @@ mod materialization_tests {
         assert!(resume_pending_materialization(&target, &head).is_err());
         assert!(lock.exists());
         std::fs::remove_file(&lock).unwrap();
+        // A dead attempt's private lock cannot block a new attempt.
+        let abandoned = Path::new(&git_dir).join("webcodex-materialization-abandoned");
+        std::fs::create_dir(&abandoned).unwrap();
+        std::fs::write(abandoned.join("index.lock"), "prior attempt").unwrap();
         resume_pending_materialization(&target, &head).unwrap();
+        assert_eq!(std::fs::read_to_string(abandoned.join("index.lock")).unwrap(), "prior attempt");
+        assert!(!lock.exists());
         assert_eq!(std::fs::read_to_string(target.join("tracked.txt")).unwrap(), "committed");
         assert_eq!(std::fs::read_to_string(source.join("tracked.txt")).unwrap(), "user edit");
         std::fs::remove_file(target.join("tracked.txt")).unwrap();
