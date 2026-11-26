@@ -114,7 +114,9 @@ fn publish_receipt_bytes(path: &Path, bytes: &[u8]) -> Result<(), &'static str> 
 
 fn mark_materialization_completed(path: &Path, receipt: &PendingMaterialization) -> Result<(), &'static str> {
     if let Some(existing) = read_pending_receipt(path)? {
-        return if &existing == receipt { Ok(()) } else { Err("managed_worktree_recovery_conflict") };
+        return if &existing == receipt {
+            super::registration::sync_dir(path.parent().ok_or("operation_indeterminate")?).map_err(|_| "operation_indeterminate")
+        } else { Err("managed_worktree_recovery_conflict") };
     }
     let bytes = serde_json::to_vec(receipt).map_err(|_| "worktree_registration_failed")?;
     publish_receipt_bytes(path, &bytes)
@@ -1073,7 +1075,7 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
     if pending.as_ref().is_some_and(|receipt| receipt.destination != destination) {
         return managed_worktree_error(start, "managed_worktree_recovery_conflict", false, Some(&base_ref), Some(&base_sha), Some(source_dirty));
     }
-    if completed.is_some() && !destination.exists() {
+    if completed.as_ref().is_some_and(|receipt| receipt.destination != destination || !destination.exists()) {
         return managed_worktree_error(start, "managed_worktree_recovery_conflict", false, Some(&base_ref), Some(&base_sha), Some(source_dirty));
     }
     let mut created_worktree = false;
@@ -1380,7 +1382,7 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
     // No registered project matched. Recovery is permitted only by a
     // previously persisted, exact creation receipt and the current root policy.
     if !created_worktree {
-        if pending.is_none() {
+        if pending.is_none() || completed.is_some() {
             return managed_worktree_error(start, "managed_worktree_recovery_conflict", true, Some(&base_ref), Some(&base_sha), Some(source_dirty));
         }
         if let Err(error) = resume_pending_materialization(&canonical_worktree, &base_sha) {
