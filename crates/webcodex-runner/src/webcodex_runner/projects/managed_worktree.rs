@@ -206,9 +206,10 @@ fn resume_pending_materialization(path: &Path, base_sha: &str) -> Result<(), &'s
         return Err("worktree_materialization_failed");
     }
     let output = run(&["--no-optional-locks", "-c", "core.longpaths=true", "status",
-        "--porcelain=v1", "--untracked-files=all"])?;
+        "--porcelain=v1", "--untracked-files=all"]).map_err(|e| { eprintln!("materialize status: {e}"); "worktree_materialization_failed" })?;
     if !output.status.success() || output.stdout_capped || output.stderr_capped
         || !output.stdout.is_empty() {
+        eprintln!("materialize status failed: {:?} stdout={} stderr={}", output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         return Err("worktree_materialization_failed");
     }
     ensure_unlocked()?;
@@ -216,10 +217,10 @@ fn resume_pending_materialization(path: &Path, base_sha: &str) -> Result<(), &'s
         // Atomic no-replace publication. No ordinary index.lock is created
         // by the materialization transaction, even if the Runner crashes.
         std::fs::File::open(&private_index).and_then(|file| file.sync_all())
-            .map_err(|_| "worktree_materialization_failed")?;
+            .map_err(|e| { eprintln!("materialize fsync private index: {e}"); "worktree_materialization_failed" })?;
         std::fs::hard_link(&private_index, &index)
-            .map_err(|_| "managed_worktree_recovery_conflict")?;
-        super::registration::sync_dir(&git_dir).map_err(|_| "operation_indeterminate")?;
+            .map_err(|e| { eprintln!("materialize publish index: {e}"); "managed_worktree_recovery_conflict" })?;
+        super::registration::sync_dir(&git_dir).map_err(|e| { eprintln!("materialize sync git dir: {e}"); "operation_indeterminate" })?;
     }
     ensure_unlocked()?;
     verify_new_worktree_materialization(path, base_sha)?;
