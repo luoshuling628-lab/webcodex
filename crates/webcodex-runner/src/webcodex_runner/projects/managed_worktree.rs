@@ -170,9 +170,7 @@ fn resume_pending_materialization(path: &Path, base_sha: &str) -> Result<(), &'s
     let has_index = match std::fs::symlink_metadata(&index) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
-            if managed_worktree_git_text(path, &["write-tree"])? != expected {
-                return Err("managed_worktree_recovery_conflict");
-            }
+            verify_index_matches_base(path, base_sha)?;
             true
         }
         _ => return Err("managed_worktree_recovery_conflict"),
@@ -185,9 +183,12 @@ fn resume_pending_materialization(path: &Path, base_sha: &str) -> Result<(), &'s
     let attempt = git_dir.join(format!("webcodex-materialization-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&attempt).map_err(|_| "worktree_materialization_failed")?;
     let private_index = attempt.join("index");
+    // Git for Windows rejects verbatim-disk paths for GIT_INDEX_FILE.
+    // Keep the canonical path for filesystem operations, render only argv/env.
+    let private_git_index = PathBuf::from(managed_worktree_git_cli_path(&private_index));
     let run = |args: &[&str]| {
         super::catalog::run_git_bounded_with_index(
-            "git", path, args, MANAGED_WORKTREE_CHECKOUT_TIMEOUT, None, Some(&private_index),
+            "git", path, args, MANAGED_WORKTREE_CHECKOUT_TIMEOUT, None, Some(&private_git_index),
         ).map_err(|_| "worktree_materialization_failed")
     };
     let output = run(&["read-tree", base_sha])?;
@@ -265,15 +266,24 @@ fn materialize_new_worktree(path: &Path, base_sha: &str) -> Result<(), &'static 
     resume_pending_materialization(path, base_sha)
 }
 
+// diff --cached compares the index with the exact commit without creating
+// an index or index.lock. write-tree is not a read-only verification command.
+fn verify_index_matches_base(path: &Path, base_sha: &str) -> Result<(), &'static str> {
+    let output = run_git_bounded(path,
+        &["--no-optional-locks", "diff", "--cached", "--quiet", base_sha, "--"],
+        MANAGED_WORKTREE_CHECKOUT_TIMEOUT, None,
+    ).map_err(|_| "worktree_materialization_failed")?;
+    if !output.status.success() || output.stdout_capped || output.stderr_capped {
+        return Err("worktree_materialization_failed");
+    }
+    Ok(())
+}
+
 fn verify_new_worktree_materialization(path: &Path, base_sha: &str) -> Result<(), &'static str> {
     if managed_worktree_git_text(path, &["rev-parse", "HEAD"])? != base_sha {
         return Err("managed_worktree_recovery_conflict");
     }
-    let expected = managed_worktree_git_text(path, &["rev-parse", "HEAD^{tree}"])?;
-    let actual = managed_worktree_git_text(path, &["write-tree"])?;
-    if actual != expected {
-        return Err("worktree_materialization_failed");
-    }
+    verify_index_matches_base(path, base_sha)?;
     let status = run_git_bounded(
         path,
         &["--no-optional-locks", "-c", "core.longpaths=true", "status", "--porcelain=v1", "--untracked-files=all"],
@@ -1555,6 +1565,8 @@ mod materialization_tests {
         // lock must be preserved. Only after release can exact recovery resume.
         let git_dir = git(&target, &["rev-parse", "--absolute-git-dir"]);
         let lock = Path::new(&git_dir).join("index.lock");
+        assert!(!Path::new(&git_dir).join("index").exists(), "verification must not create an index");
+        assert!(!lock.exists(), "verification must not create an index lock");
         std::fs::write(&lock, "").unwrap();
         assert!(resume_pending_materialization(&target, &head).is_err());
         assert!(lock.exists());
